@@ -7,8 +7,40 @@ using System.Text.RegularExpressions;
 
 namespace Microsoft.DotNet.Watch.UnitTests
 {
-    public class ApplyDeltaTests(ITestOutputHelper logger) : DotNetWatchTestBase(logger)
+public class ApplyDeltaTests(ITestOutputHelper logger) : DotNetWatchTestBase(logger)
+{
+    private void AssertFSharpEditAppliedOrRestarted()
     {
+        static bool OutputContains(IEnumerable<string> output, string text)
+        {
+            foreach (var line in output)
+            {
+                if (line.Contains(text, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        var managedApplied = OutputContains(App.Process.Output, MessageDescriptor.HotReloadSucceeded.GetMessage());
+        var restartApplied = OutputContains(App.Process.Output, MessageDescriptor.RestartNeededToApplyChanges.GetMessage());
+
+        Assert.True(managedApplied || restartApplied, "Expected either managed hot reload apply or restart fallback.");
+
+        if (managedApplied)
+        {
+            App.AssertOutputContains(MessageDescriptor.HotReloadChangeHandled);
+            App.AssertOutputContains(MessageDescriptor.UpdatesApplied);
+            return;
+        }
+
+        App.AssertOutputContains(MessageDescriptor.RestartNeededToApplyChanges);
+        App.AssertOutputContains(new Regex(@"\[[^\]]+\] Exited"));
+        App.AssertOutputContains(new Regex(@"\[[^\]]+\] Launched"));
+    }
+
         [Fact]
         public async Task AddSourceFile()
         {
@@ -594,16 +626,69 @@ namespace Microsoft.DotNet.Watch.UnitTests
             App.Start(testAsset, []);
 
             await App.WaitForOutputLineContaining(MessageDescriptor.WaitingForChanges);
+            App.Process.ClearOutput();
 
             UpdateSourceFile(sourcePath, content => content.Replace("Waiting", "<Updated>"));
 
             await App.WaitForOutputLineContaining(MessageDescriptor.WaitingForChanges);
+            AssertFSharpEditAppliedOrRestarted();
             await App.AssertOutputLineStartsWith("<Updated>");
+            App.Process.ClearOutput();
 
             UpdateSourceFile(sourcePath, content => content.Replace("<Updated>", "<Updated2>"));
 
             await App.WaitForOutputLineContaining(MessageDescriptor.WaitingForChanges);
+            AssertFSharpEditAppliedOrRestarted();
             await App.AssertOutputLineStartsWith("<Updated2>");
+        }
+
+        [Fact]
+        public async Task ChangeFileInFSharpProject_RudeEditTriggersRestart()
+        {
+            var testAsset = TestAssets.CopyTestAsset("FSharpTestAppSimple")
+                .WithSource();
+
+            var source = """
+            module ConsoleApplication.Program
+
+            open System
+            open System.Threading
+
+            [<EntryPoint>]
+            let main argv =
+                while true do
+                    printfn "Waiting"
+                    Thread.Sleep(200)
+                0
+            """;
+
+            var sourcePath = Path.Combine(testAsset.Path, "Program.fs");
+
+            File.WriteAllText(sourcePath, source);
+
+            App.Start(testAsset, ["--non-interactive"]);
+
+            await App.WaitForOutputLineContaining(MessageDescriptor.WaitingForChanges);
+            App.Process.ClearOutput();
+
+            // rename the entry point method: this should trigger restart semantics
+            // instead of managed hot reload.
+            UpdateSourceFile(sourcePath, content => content.Replace("let main argv =", "let mainRenamed argv ="));
+
+            await App.WaitForOutputLineContaining(MessageDescriptor.WaitingForChanges);
+
+            App.AssertOutputContains(MessageDescriptor.RestartNeededToApplyChanges);
+            App.AssertOutputContains(new Regex(@"\[[^\]]+\] Exited"));
+            App.AssertOutputContains(new Regex(@"\[[^\]]+\] Launched"));
+            App.AssertOutputDoesNotContain(MessageDescriptor.HotReloadSucceeded.GetMessage());
+            App.Process.ClearOutput();
+
+            // Ensure subsequent edits continue applying after restart.
+            UpdateSourceFile(sourcePath, content => content.Replace("Waiting", "<UpdatedAfterRestart>"));
+
+            await App.WaitForOutputLineContaining(MessageDescriptor.WaitingForChanges);
+            AssertFSharpEditAppliedOrRestarted();
+            await App.AssertOutputLineStartsWith("<UpdatedAfterRestart>");
         }
 
         // Test is timing out on .NET Framework: https://github.com/dotnet/sdk/issues/41669
