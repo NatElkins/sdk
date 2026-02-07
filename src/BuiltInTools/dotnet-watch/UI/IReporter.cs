@@ -218,7 +218,8 @@ namespace Microsoft.DotNet.Watch
         public static readonly MessageDescriptor FileAdditionTriggeredReEvaluation = Create("File addition triggered re-evaluation.", Emoji.Watch, MessageSeverity.Verbose);
         public static readonly MessageDescriptor ReEvaluationCompleted = Create("Re-evaluation completed.", Emoji.Watch, MessageSeverity.Verbose);
         public static readonly MessageDescriptor ProjectChangeTriggeredReEvaluation = Create("Project change triggered re-evaluation.", Emoji.Watch, MessageSeverity.Verbose);
-        public static readonly MessageDescriptor NoCSharpChangesToApply = Create("No C# changes to apply.", Emoji.Watch, MessageSeverity.Output);
+        public static readonly MessageDescriptor NoManagedCodeChangesToApply = Create("No managed code changes to apply.", Emoji.Watch, MessageSeverity.Output);
+        public static readonly MessageDescriptor NoCSharpChangesToApply = NoManagedCodeChangesToApply;
         public static readonly MessageDescriptor Exited = Create("Exited", Emoji.Watch, MessageSeverity.Output);
         public static readonly MessageDescriptor ExitedWithUnknownErrorCode = Create("Exited with unknown error code", Emoji.Error, MessageSeverity.Error);
         public static readonly MessageDescriptor ExitedWithErrorCode = Create("Exited with error code {0}", Emoji.Error, MessageSeverity.Error);

@@ -8,16 +8,20 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.ExternalAccess.Watch.Api;
 using Microsoft.DotNet.HotReload;
+using Microsoft.DotNet.Watch.HotReload.FSharp;
 using Microsoft.Extensions.Logging;
 
 namespace Microsoft.DotNet.Watch
 {
     internal sealed class CompilationHandler : IDisposable
     {
+        internal readonly record struct ManagedCodeUpdateEnvelope(string ProjectPath, HotReloadManagedCodeUpdate Update);
+
         public readonly IncrementalMSBuildWorkspace Workspace;
         private readonly ILoggerFactory _loggerFactory;
         private readonly ILogger _logger;
         private readonly WatchHotReloadService _hotReloadService;
+        private readonly FSharpHotReloadService _fsharpHotReloadService;
         private readonly ProcessRunner _processRunner;
 
         /// <summary>
@@ -36,7 +40,7 @@ namespace Microsoft.DotNet.Watch
         /// <summary>
         /// All updates that were attempted. Includes updates whose application failed.
         /// </summary>
-        private ImmutableList<WatchHotReloadService.Update> _previousUpdates = [];
+        private ImmutableList<ManagedCodeUpdateEnvelope> _previousUpdates = [];
 
         private bool _isDisposed;
 
@@ -47,11 +51,13 @@ namespace Microsoft.DotNet.Watch
             _processRunner = processRunner;
             Workspace = new IncrementalMSBuildWorkspace(logger);
             _hotReloadService = new WatchHotReloadService(Workspace.CurrentSolution.Services, () => ValueTask.FromResult(GetAggregateCapabilities()));
+            _fsharpHotReloadService = new FSharpHotReloadService(logger);
         }
 
         public void Dispose()
         {
             _isDisposed = true;
+            _fsharpHotReloadService.EndSession();
             Workspace?.Dispose();
         }
 
@@ -69,7 +75,10 @@ namespace Microsoft.DotNet.Watch
             Dispose();
         }
 
-        private void DiscardPreviousUpdates(ImmutableArray<ProjectId> projectsToBeRebuilt)
+        public void UpdateFSharpProjects(ProjectGraph projectGraph)
+            => _fsharpHotReloadService.UpdateProjects(projectGraph);
+
+        private void DiscardPreviousUpdates(ImmutableArray<string> projectsToBeRebuilt)
         {
             // Remove previous updates to all modules that were affected by rude edits.
             // All running projects that statically reference these modules have been terminated.
@@ -79,14 +88,17 @@ namespace Microsoft.DotNet.Watch
 
             lock (_runningProjectsAndUpdatesGuard)
             {
-                _previousUpdates = _previousUpdates.RemoveAll(update => projectsToBeRebuilt.Contains(update.ProjectId));
+                var rebuiltProjects = projectsToBeRebuilt.ToHashSet(PathUtilities.OSSpecificPathComparer);
+                _previousUpdates = _previousUpdates.RemoveAll(update => rebuiltProjects.Contains(update.ProjectPath));
             }
         }
+
         public async ValueTask StartSessionAsync(CancellationToken cancellationToken)
         {
             _logger.Log(MessageDescriptor.HotReloadSessionStarting);
 
             await _hotReloadService.StartSessionAsync(Workspace.CurrentSolution, cancellationToken);
+            await _fsharpHotReloadService.StartSessionAsync(cancellationToken);
 
             _logger.Log(MessageDescriptor.HotReloadSessionStarted);
         }
@@ -152,10 +164,10 @@ namespace Microsoft.DotNet.Watch
                 // Observe updates that need to be applied to the new process
                 // and apply them before adding it to running processes.
                 // Do not block on udpates being made to other processes to avoid delaying the new process being up-to-date.
-                var updatesToApply = _previousUpdates.Skip(appliedUpdateCount).ToImmutableArray();
+                var updatesToApply = _previousUpdates.Skip(appliedUpdateCount).Select(update => update.Update).ToImmutableArray();
                 if (updatesToApply.Any())
                 {
-                    await clients.ApplyManagedCodeUpdatesAsync(ToManagedCodeUpdates(updatesToApply), isProcessSuspended: false, processCommunicationCancellationSource.Token);
+                    await clients.ApplyManagedCodeUpdatesAsync(updatesToApply, isProcessSuspended: false, processCommunicationCancellationSource.Token);
                 }
 
                 appliedUpdateCount += updatesToApply.Length;
@@ -226,10 +238,11 @@ namespace Microsoft.DotNet.Watch
         }
 
         public async ValueTask<(
-                ImmutableArray<WatchHotReloadService.Update> projectUpdates,
+                ImmutableArray<ManagedCodeUpdateEnvelope> projectUpdates,
                 ImmutableArray<string> projectsToRebuild,
                 ImmutableArray<string> projectsToRedeploy,
                 ImmutableArray<RunningProject> terminatedProjects)> HandleManagedCodeChangesAsync(
+            IReadOnlyList<ChangedFile> changedFiles,
             bool autoRestart,
             Func<IEnumerable<string>, CancellationToken, Task<bool>> restartPrompt,
             CancellationToken cancellationToken)
@@ -246,15 +259,24 @@ namespace Microsoft.DotNet.Watch
                 .ToImmutableDictionary(e => e.Id, e => e.info);
 
             var updates = await _hotReloadService.GetUpdatesAsync(currentSolution, runningProjectInfos, cancellationToken);
+            var fsharpResult = await _fsharpHotReloadService.TryEmitUpdatesAsync(changedFiles, runningProjects, cancellationToken);
 
             await DisplayResultsAsync(updates, runningProjectInfos, cancellationToken);
 
-            if (updates.Status is WatchHotReloadService.Status.NoChangesToApply or WatchHotReloadService.Status.Blocked)
+            if (updates.Status == WatchHotReloadService.Status.Blocked || fsharpResult.Status == FSharpManagedUpdateStatus.Blocked)
             {
                 // If Hot Reload is blocked (due to compilation error) we ignore the current
                 // changes and await the next file change.
 
                 // Note: CommitUpdate/DiscardUpdate is not expected to be called.
+                return ([], [], [], []);
+            }
+
+            var roslynHasUpdates = updates.Status == WatchHotReloadService.Status.ReadyToApply;
+            var fsharpHasUpdates = fsharpResult.Status == FSharpManagedUpdateStatus.ReadyToApply;
+            if (!roslynHasUpdates && !fsharpHasUpdates && fsharpResult.Status != FSharpManagedUpdateStatus.RestartRequired)
+            {
+                _logger.Log(MessageDescriptor.NoManagedCodeChangesToApply);
                 return ([], [], [], []);
             }
 
@@ -274,26 +296,62 @@ namespace Microsoft.DotNet.Watch
                 return ([], [], [], []);
             }
 
-            // Note: Releases locked project baseline readers, so we can rebuild any projects that need rebuilding.
-            _hotReloadService.CommitUpdate();
+            if (roslynHasUpdates)
+            {
+                // Note: Releases locked project baseline readers, so we can rebuild any projects that need rebuilding.
+                _hotReloadService.CommitUpdate();
+            }
 
-            DiscardPreviousUpdates(updates.ProjectsToRebuild);
+            var roslynProjectUpdates = roslynHasUpdates
+                ? updates.ProjectUpdates.Select(update =>
+                {
+                    var projectPath = currentSolution.GetProject(update.ProjectId)!.FilePath!;
+                    return new ManagedCodeUpdateEnvelope(
+                        projectPath,
+                        new HotReloadManagedCodeUpdate(update.ModuleId, update.MetadataDelta, update.ILDelta, update.PdbDelta, update.UpdatedTypes, update.RequiredCapabilities));
+                }).ToImmutableArray()
+                : [];
+
+            var fsharpProjectUpdates = fsharpResult.Updates.Select(update => new ManagedCodeUpdateEnvelope(update.ProjectPath, update.Update)).ToImmutableArray();
+            var allProjectUpdates = roslynProjectUpdates.AddRange(fsharpProjectUpdates);
 
             var projectsToRebuild = updates.ProjectsToRebuild.Select(id => currentSolution.GetProject(id)!.FilePath!).ToImmutableArray();
+            if (fsharpResult.Status == FSharpManagedUpdateStatus.RestartRequired && fsharpResult.ProjectPath != null)
+            {
+                projectsToRebuild = projectsToRebuild.Add(fsharpResult.ProjectPath);
+            }
+
+            DiscardPreviousUpdates(projectsToRebuild);
+
             var projectsToRedeploy = updates.ProjectsToRedeploy.Select(id => currentSolution.GetProject(id)!.FilePath!).ToImmutableArray();
+            var restartProjectPaths = updates.ProjectsToRestart.Select(e => currentSolution.GetProject(e.Key)!.FilePath!).ToImmutableArray();
+
+            if (fsharpResult.Status == FSharpManagedUpdateStatus.RestartRequired && fsharpResult.ProjectPath != null)
+            {
+                if (!restartProjectPaths.Contains(fsharpResult.ProjectPath, PathUtilities.OSSpecificPathComparer))
+                {
+                    restartProjectPaths = restartProjectPaths.Add(fsharpResult.ProjectPath);
+                }
+
+                if (updates.ProjectsToRestart.IsEmpty)
+                {
+                    _logger.Log(MessageDescriptor.RestartNeededToApplyChanges);
+                }
+            }
 
             // Terminate all tracked processes that need to be restarted,
             // except for the root process, which will terminate later on.
-            var terminatedProjects = updates.ProjectsToRestart.IsEmpty
+            var terminatedProjects = restartProjectPaths.IsEmpty
                 ? []
-                : await TerminateNonRootProcessesAsync(updates.ProjectsToRestart.Select(e => currentSolution.GetProject(e.Key)!.FilePath!), cancellationToken);
+                : await TerminateNonRootProcessesAsync(restartProjectPaths, cancellationToken);
 
-            return (updates.ProjectUpdates, projectsToRebuild, projectsToRedeploy, terminatedProjects);
+            return (allProjectUpdates, projectsToRebuild, projectsToRedeploy, terminatedProjects);
         }
 
-        public async ValueTask ApplyUpdatesAsync(ImmutableArray<WatchHotReloadService.Update> updates, CancellationToken cancellationToken)
+        public async ValueTask ApplyUpdatesAsync(ImmutableArray<ManagedCodeUpdateEnvelope> updates, CancellationToken cancellationToken)
         {
             Debug.Assert(!updates.IsEmpty);
+            var managedCodeUpdates = updates.Select(update => update.Update).ToImmutableArray();
 
             ImmutableDictionary<string, ImmutableArray<RunningProject>> projectsToUpdate;
             lock (_runningProjectsAndUpdatesGuard)
@@ -313,7 +371,7 @@ namespace Microsoft.DotNet.Watch
                 try
                 {
                     using var processCommunicationCancellationSource = CancellationTokenSource.CreateLinkedTokenSource(runningProject.ProcessExitedSource.Token, cancellationToken);
-                    await runningProject.Clients.ApplyManagedCodeUpdatesAsync(ToManagedCodeUpdates(updates), isProcessSuspended: false, processCommunicationCancellationSource.Token);
+                    await runningProject.Clients.ApplyManagedCodeUpdatesAsync(managedCodeUpdates, isProcessSuspended: false, processCommunicationCancellationSource.Token);
                 }
                 catch (OperationCanceledException) when (runningProject.ProcessExitedSource.Token.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                 {
@@ -347,7 +405,7 @@ namespace Microsoft.DotNet.Watch
                     break;
 
                 case WatchHotReloadService.Status.NoChangesToApply:
-                    _logger.Log(MessageDescriptor.NoCSharpChangesToApply);
+                    // No-change messaging is emitted after combining Roslyn + F# update paths.
                     break;
 
                 case WatchHotReloadService.Status.Blocked:
@@ -628,8 +686,5 @@ namespace Microsoft.DotNet.Watch
 
         private static Task ForEachProjectAsync(ImmutableDictionary<string, ImmutableArray<RunningProject>> projects, Func<RunningProject, CancellationToken, Task> action, CancellationToken cancellationToken)
             => Task.WhenAll(projects.SelectMany(entry => entry.Value).Select(project => action(project, cancellationToken))).WaitAsync(cancellationToken);
-
-        private static ImmutableArray<HotReloadManagedCodeUpdate> ToManagedCodeUpdates(ImmutableArray<WatchHotReloadService.Update> updates)
-            => [.. updates.Select(update => new HotReloadManagedCodeUpdate(update.ModuleId, update.MetadataDelta, update.ILDelta, update.PdbDelta, update.UpdatedTypes, update.RequiredCapabilities))];
     }
 }

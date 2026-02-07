@@ -109,6 +109,7 @@ namespace Microsoft.DotNet.Watch
 
                     var projectMap = new ProjectNodeMap(evaluationResult.ProjectGraph, _context.Logger);
                     compilationHandler = new CompilationHandler(_context.LoggerFactory, _context.Logger, _context.ProcessRunner);
+                    compilationHandler.UpdateFSharpProjects(evaluationResult.ProjectGraph);
                     var scopedCssFileHandler = new ScopedCssFileHandler(_context.Logger, _context.BuildLogger, projectMap, _context.BrowserRefreshServerFactory, _context.Options, _context.EnvironmentOptions);
                     var projectLauncher = new ProjectLauncher(_context, projectMap, compilationHandler, iteration);
                     evaluationResult.ItemExclusions.Report(_context.Logger);
@@ -268,6 +269,7 @@ namespace Microsoft.DotNet.Watch
                         HotReloadEventSource.Log.HotReloadStart(HotReloadEventSource.StartType.CompilationHandler);
 
                         var (managedCodeUpdates, projectsToRebuild, projectsToRedeploy, projectsToRestart) = await compilationHandler.HandleManagedCodeChangesAsync(
+                            changedFiles,
                             autoRestart: _context.Options.NonInteractive || _rudeEditRestartPrompt?.AutoRestartPreference is true,
                             restartPrompt: async (projectNames, cancellationToken) =>
                             {
@@ -456,6 +458,7 @@ namespace Microsoft.DotNet.Watch
 
                                 // TODO: consider re-evaluating only affected projects instead of the whole graph.
                                 evaluationResult = await EvaluateRootProjectAsync(restore: true, iterationCancellationToken);
+                                compilationHandler.UpdateFSharpProjects(evaluationResult.ProjectGraph);
 
                                 // additional files/directories may have been added:
                                 evaluationResult.WatchFiles(fileWatcher);
