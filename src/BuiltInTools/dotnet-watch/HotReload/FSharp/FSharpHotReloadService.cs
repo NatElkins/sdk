@@ -3,6 +3,7 @@
 
 using System.Collections;
 using System.Collections.Immutable;
+using System.Diagnostics;
 using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
@@ -75,11 +76,23 @@ internal sealed class FSharpHotReloadService
         var changedProject = TryGetChangedRunningFSharpProject(changedFiles, runningProjects);
         if (changedProject == null)
         {
+            if (_trace)
+            {
+                _logger.LogDebug("No running F# project matched the current file changes.");
+            }
+
             return new FSharpManagedUpdateResult(FSharpManagedUpdateStatus.NoChanges, [], null, null);
         }
 
         if (!_projects.TryGetValue(changedProject.Value, out var projectInfo))
         {
+            if (_trace)
+            {
+                _logger.LogDebug(
+                    "Changed F# project '{ProjectPath}' is not present in the current project graph snapshot.",
+                    changedProject.Value.ProjectPath);
+            }
+
             return new FSharpManagedUpdateResult(FSharpManagedUpdateStatus.NoChanges, [], null, null);
         }
 
@@ -100,6 +113,17 @@ internal sealed class FSharpHotReloadService
         if (!EnsureSession(host, projectInfo, out var ensureStatus, out var ensureMessage))
         {
             return new FSharpManagedUpdateResult(ensureStatus, [], projectInfo.ProjectPath, ensureMessage);
+        }
+
+        if (!TryCompileProjectOutput(projectInfo, out var compileMessage))
+        {
+            return new FSharpManagedUpdateResult(FSharpManagedUpdateStatus.Blocked, [], projectInfo.ProjectPath, compileMessage);
+        }
+
+        var changedSourceFiles = GetChangedSourceFilesForProject(changedFiles, projectInfo.ProjectId);
+        foreach (var changedSourceFile in changedSourceFiles)
+        {
+            host.NotifyFileChanged(changedSourceFile, _activeProjectOptions!, cancellationToken);
         }
 
         var moduleId = TryGetModuleVersionId(projectInfo.TargetPath);
@@ -203,11 +227,11 @@ internal sealed class FSharpHotReloadService
                 continue;
             }
 
-            foreach (var containingProjectPath in file.Item.ContainingProjectPaths)
-            {
-                if (!runningProjects.ContainsKey(containingProjectPath))
+                foreach (var containingProjectPath in file.Item.ContainingProjectPaths)
                 {
-                    continue;
+                    if (!runningProjects.ContainsKey(containingProjectPath))
+                    {
+                        continue;
                 }
 
                 foreach (var projectId in _projects.Keys)
@@ -218,9 +242,110 @@ internal sealed class FSharpHotReloadService
                     }
                 }
             }
+
+            if (TryMatchRunningProjectByPath(file.Item.FilePath, runningProjects, out var fallbackProject))
+            {
+                if (_trace)
+                {
+                    _logger.LogDebug(
+                        "F# changed file '{FilePath}' matched project '{ProjectPath}' using path fallback.",
+                        file.Item.FilePath,
+                        fallbackProject.ProjectPath);
+                }
+
+                return fallbackProject;
+            }
         }
 
         return null;
+    }
+
+    private bool TryMatchRunningProjectByPath(
+        string filePath,
+        ImmutableDictionary<string, ImmutableArray<RunningProject>> runningProjects,
+        out ProjectInstanceId projectId)
+    {
+        projectId = default;
+
+        string normalizedFilePath;
+        try
+        {
+            normalizedFilePath = Path.GetFullPath(filePath);
+        }
+        catch
+        {
+            return false;
+        }
+
+        foreach (var knownProject in _projects.Keys)
+        {
+            if (!runningProjects.ContainsKey(knownProject.ProjectPath))
+            {
+                continue;
+            }
+
+            if (IsFileWithinProjectDirectory(normalizedFilePath, knownProject.ProjectPath))
+            {
+                projectId = knownProject;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private ImmutableArray<string> GetChangedSourceFilesForProject(
+        IReadOnlyList<ChangedFile> changedFiles,
+        ProjectInstanceId projectId)
+    {
+        var changedSourceFiles = new HashSet<string>(PathUtilities.OSSpecificPathComparer);
+
+        foreach (var changedFile in changedFiles)
+        {
+            var filePath = changedFile.Item.FilePath;
+            if (!IsFSharpSourcePath(filePath))
+            {
+                continue;
+            }
+
+            var isProjectMatchFromContainingPaths =
+                changedFile.Item.ContainingProjectPaths.Any(containingProjectPath =>
+                    PathUtilities.OSSpecificPathComparer.Equals(containingProjectPath, projectId.ProjectPath));
+
+            if (isProjectMatchFromContainingPaths || IsFileWithinProjectDirectory(filePath, projectId.ProjectPath))
+            {
+                try
+                {
+                    changedSourceFiles.Add(Path.GetFullPath(filePath));
+                }
+                catch
+                {
+                    changedSourceFiles.Add(filePath);
+                }
+            }
+        }
+
+        return [.. changedSourceFiles];
+    }
+
+    private static bool IsFileWithinProjectDirectory(string filePath, string projectPath)
+    {
+        try
+        {
+            var projectDirectory = Path.GetDirectoryName(projectPath);
+            if (projectDirectory == null)
+            {
+                return false;
+            }
+
+            var normalizedFilePath = Path.GetFullPath(filePath);
+            var normalizedProjectDirectory = PathUtilities.EnsureTrailingSlash(Path.GetFullPath(projectDirectory));
+            return normalizedFilePath.StartsWith(normalizedProjectDirectory, PathUtilities.OSSpecificPathComparison);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private bool EnsureSession(FSharpReflectionHost host, FSharpProjectInfo projectInfo, out FSharpManagedUpdateStatus status, out string? message)
@@ -321,6 +446,68 @@ internal sealed class FSharpHotReloadService
                string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
     }
 
+    private bool TryCompileProjectOutput(FSharpProjectInfo projectInfo, out string? message)
+    {
+        message = null;
+
+        try
+        {
+            var projectDirectory = Path.GetDirectoryName(projectInfo.ProjectPath) ?? Directory.GetCurrentDirectory();
+            var forcedOutputPath = Path.Combine(
+                projectDirectory,
+                "obj",
+                $".dotnet-watch-fsharp-emit-{Guid.NewGuid():N}.tmp");
+
+            var dotnetHostPath =
+                Environment.ProcessPath ??
+                Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ??
+                "dotnet";
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = dotnetHostPath,
+                WorkingDirectory = projectDirectory,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+
+            startInfo.ArgumentList.Add("msbuild");
+            startInfo.ArgumentList.Add(projectInfo.ProjectPath);
+            startInfo.ArgumentList.Add("-nologo");
+            startInfo.ArgumentList.Add("-t:Compile");
+            startInfo.ArgumentList.Add("-p:NuGetInteractive=true");
+            startInfo.ArgumentList.Add($"-p:NonExistentFile={forcedOutputPath}");
+
+            using var process = Process.Start(startInfo);
+            if (process == null)
+            {
+                message = $"Failed to start MSBuild compile for '{projectInfo.ProjectPath}'.";
+                return false;
+            }
+
+            var standardOutputTask = process.StandardOutput.ReadToEndAsync();
+            var standardErrorTask = process.StandardError.ReadToEndAsync();
+            process.WaitForExit();
+
+            if (process.ExitCode == 0)
+            {
+                return true;
+            }
+
+            var standardOutput = standardOutputTask.GetAwaiter().GetResult();
+            var standardError = standardErrorTask.GetAwaiter().GetResult();
+            var details = string.IsNullOrWhiteSpace(standardError) ? standardOutput : standardError;
+            message = $"MSBuild Compile target failed for '{projectInfo.ProjectPath}' (exit code {process.ExitCode}). {details.Trim()}";
+            return false;
+        }
+        catch (Exception ex)
+        {
+            message = ex.Message;
+            return false;
+        }
+    }
+
     private sealed class FSharpReflectionHost
     {
         private readonly ILogger _logger;
@@ -328,6 +515,7 @@ internal sealed class FSharpHotReloadService
         private readonly object _checker;
         private readonly MethodInfo _getProjectOptions;
         private readonly MethodInfo _startSession;
+        private readonly MethodInfo? _notifyFileChanged;
         private readonly MethodInfo _emitDelta;
         private readonly MethodInfo _endSession;
         private readonly MethodInfo _runSynchronously;
@@ -338,6 +526,7 @@ internal sealed class FSharpHotReloadService
             object checker,
             MethodInfo getProjectOptions,
             MethodInfo startSession,
+            MethodInfo? notifyFileChanged,
             MethodInfo emitDelta,
             MethodInfo endSession,
             MethodInfo runSynchronously)
@@ -347,6 +536,7 @@ internal sealed class FSharpHotReloadService
             _checker = checker;
             _getProjectOptions = getProjectOptions;
             _startSession = startSession;
+            _notifyFileChanged = notifyFileChanged;
             _emitDelta = emitDelta;
             _endSession = endSession;
             _runSynchronously = runSynchronously;
@@ -383,7 +573,8 @@ internal sealed class FSharpHotReloadService
                 var createMethod = checkerType.GetMethod("Create", BindingFlags.Public | BindingFlags.Static)
                     ?? throw new MissingMethodException(checkerType.FullName, "Create");
 
-                var checker = createMethod.Invoke(null, createMethod.GetParameters().Select(_ => (object?)null).ToArray())
+                var createArguments = CreateCheckerArguments(createMethod.GetParameters());
+                var checker = createMethod.Invoke(null, createArguments)
                     ?? throw new InvalidOperationException("FSharpChecker.Create returned null.");
 
                 var getProjectOptions = checkerType.GetMethod("GetProjectOptionsFromCommandLineArgs", BindingFlags.Public | BindingFlags.Instance)
@@ -391,6 +582,9 @@ internal sealed class FSharpHotReloadService
 
                 var startSession = checkerType.GetMethod("StartHotReloadSession", BindingFlags.Public | BindingFlags.Instance)
                     ?? throw new MissingMethodException(checkerType.FullName, "StartHotReloadSession");
+
+                var notifyFileChanged = checkerType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .FirstOrDefault(method => method.Name == "NotifyFileChanged" && method.GetParameters().Length >= 2);
 
                 var emitDelta = checkerType.GetMethod("EmitHotReloadDelta", BindingFlags.Public | BindingFlags.Instance)
                     ?? throw new MissingMethodException(checkerType.FullName, "EmitHotReloadDelta");
@@ -402,7 +596,7 @@ internal sealed class FSharpHotReloadService
                 var runSynchronously = fsharpAsyncType.GetMethods(BindingFlags.Public | BindingFlags.Static)
                     .First(method => method.Name == "RunSynchronously" && method.IsGenericMethod && method.GetParameters().Length == 3);
 
-                host = new FSharpReflectionHost(logger, trace, checker, getProjectOptions, startSession, emitDelta, endSession, runSynchronously);
+                host = new FSharpReflectionHost(logger, trace, checker, getProjectOptions, startSession, notifyFileChanged, emitDelta, endSession, runSynchronously);
                 return true;
             }
             catch (Exception ex)
@@ -437,6 +631,35 @@ internal sealed class FSharpHotReloadService
 
         public FSharpInvocationResult StartSession(object projectOptions, CancellationToken cancellationToken)
             => InvokeResult(_startSession, [projectOptions, null], cancellationToken);
+
+        public void NotifyFileChanged(string filePath, object projectOptions, CancellationToken cancellationToken)
+        {
+            if (_notifyFileChanged == null)
+            {
+                return;
+            }
+
+            try
+            {
+                var asyncComputation = _notifyFileChanged.Invoke(_checker, [filePath, projectOptions, null]);
+                if (asyncComputation == null)
+                {
+                    return;
+                }
+
+                var asyncResultType = _notifyFileChanged.ReturnType.GetGenericArguments().Single();
+                var runSync = _runSynchronously.MakeGenericMethod(asyncResultType);
+                _ = runSync.Invoke(null, [asyncComputation, null, null]);
+            }
+            catch (Exception ex)
+            {
+                if (_trace)
+                {
+                    var rootException = (ex as TargetInvocationException)?.InnerException ?? ex.GetBaseException();
+                    _logger.LogDebug("F# NotifyFileChanged failed for '{FilePath}': {Message}", filePath, rootException.Message);
+                }
+            }
+        }
 
         public FSharpInvocationResult EmitDelta(object projectOptions, CancellationToken cancellationToken)
             => InvokeResult(_emitDelta, [projectOptions, null], cancellationToken);
@@ -515,7 +738,8 @@ internal sealed class FSharpHotReloadService
             }
             catch (Exception ex)
             {
-                return new FSharpInvocationResult(false, null, null, ex.Message);
+                var rootException = (ex as TargetInvocationException)?.InnerException ?? ex.GetBaseException();
+                return new FSharpInvocationResult(false, null, null, rootException.Message);
             }
         }
 
@@ -530,6 +754,43 @@ internal sealed class FSharpHotReloadService
             var index = text.IndexOfAny(delimiters);
             return index > 0 ? text[..index] : text;
         }
+
+        private static object?[] CreateCheckerArguments(ParameterInfo[] parameters)
+        {
+            var arguments = new object?[parameters.Length];
+
+            for (var i = 0; i < parameters.Length; i++)
+            {
+                var parameter = parameters[i];
+
+                // Hot reload APIs require keepAssemblyContents=true in recent FCS versions.
+                if (string.Equals(parameter.Name, "keepAssemblyContents", StringComparison.Ordinal))
+                {
+                    if (parameter.ParameterType == typeof(bool) || parameter.ParameterType == typeof(bool?))
+                    {
+                        arguments[i] = true;
+                        continue;
+                    }
+
+                    if (IsFSharpOptionOfBoolean(parameter.ParameterType))
+                    {
+                        arguments[i] = CreateFSharpOptionSomeBoolean(parameter.ParameterType, value: true);
+                        continue;
+                    }
+                }
+            }
+
+            return arguments;
+        }
+
+        private static bool IsFSharpOptionOfBoolean(Type parameterType)
+            => parameterType.IsGenericType &&
+               string.Equals(parameterType.GetGenericTypeDefinition().FullName, "Microsoft.FSharp.Core.FSharpOption`1", StringComparison.Ordinal) &&
+               parameterType.GetGenericArguments() is [var argumentType] &&
+               argumentType == typeof(bool);
+
+        private static object? CreateFSharpOptionSomeBoolean(Type optionType, bool value)
+            => optionType.GetMethod("Some", BindingFlags.Public | BindingFlags.Static, [typeof(bool)])?.Invoke(null, [value]);
 
         internal readonly record struct FSharpInvocationResult(bool IsSuccess, object? Value, string? ErrorCase, string? ErrorText);
     }

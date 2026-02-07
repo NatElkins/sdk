@@ -5,6 +5,7 @@ using System.Collections.Immutable;
 using System.IO;
 using Microsoft.Build.Graph;
 using Microsoft.Extensions.Logging;
+using BuildLogger = Microsoft.Build.Framework.ILogger;
 
 namespace Microsoft.DotNet.Watch.HotReload.FSharp;
 
@@ -32,7 +33,7 @@ internal sealed record FSharpProjectInfo(
             var targetFramework = node.GetTargetFramework();
             var targetPath = node.ProjectInstance.GetPropertyValue(PropertyNames.TargetPath);
             var dotnetFscCompilerPath = node.ProjectInstance.GetPropertyValue("DotnetFscCompilerPath");
-            var commandLineArgs = node.ProjectInstance.GetItems("FscCommandLineArgs").Select(item => item.EvaluatedInclude).ToImmutableArray();
+            var commandLineArgs = GetCommandLineArgs(node, logger, trace);
 
             if (string.IsNullOrEmpty(targetPath) || string.IsNullOrEmpty(dotnetFscCompilerPath) || commandLineArgs.IsEmpty)
             {
@@ -54,8 +55,8 @@ internal sealed record FSharpProjectInfo(
                 projectId,
                 projectPath,
                 targetFramework,
-                Path.GetFullPath(targetPath),
-                Path.GetFullPath(dotnetFscCompilerPath),
+                NormalizeFullPath(targetPath),
+                NormalizeFullPath(dotnetFscCompilerPath),
                 commandLineArgs);
 
             if (trace)
@@ -74,6 +75,46 @@ internal sealed record FSharpProjectInfo(
         return builder.ToImmutable();
     }
 
+    private static ImmutableArray<string> GetCommandLineArgs(ProjectGraphNode node, ILogger logger, bool trace)
+    {
+        var commandLineArgs = node.ProjectInstance.GetItems("FscCommandLineArgs").Select(item => item.EvaluatedInclude).ToImmutableArray();
+        if (!commandLineArgs.IsEmpty)
+        {
+            return commandLineArgs;
+        }
+
+        // CoreCompile is often skipped as up-to-date during design-time evaluation, which leaves
+        // FscCommandLineArgs empty. Force a no-op compile pass to materialize captured arguments.
+        var designTimeProject = node.ProjectInstance.DeepCopy();
+        var forcedOutputPath = Path.Combine(
+            Path.GetDirectoryName(designTimeProject.FullPath) ?? Directory.GetCurrentDirectory(),
+            "obj",
+            $".dotnet-watch-fsharp-force-{Guid.NewGuid():N}.tmp");
+        designTimeProject.SetProperty("NonExistentFile", forcedOutputPath);
+
+        var customCollectWatchItems = designTimeProject.GetStringListPropertyValue(PropertyNames.CustomCollectWatchItems);
+        if (!designTimeProject.Build([TargetNames.Compile, .. customCollectWatchItems], Array.Empty<BuildLogger>()))
+        {
+            if (trace)
+            {
+                logger.LogDebug("F# design-time compile failed while collecting command-line arguments for '{ProjectPath}'.", designTimeProject.FullPath);
+            }
+
+            return [];
+        }
+
+        commandLineArgs = designTimeProject.GetItems("FscCommandLineArgs").Select(item => item.EvaluatedInclude).ToImmutableArray();
+        if (trace)
+        {
+            logger.LogDebug(
+                "F# command-line argument capture after forced compile for '{ProjectPath}': {ArgCount} argument(s).",
+                designTimeProject.FullPath,
+                commandLineArgs.Length);
+        }
+
+        return commandLineArgs;
+    }
+
     private static bool IsFSharpProject(ProjectGraphNode node)
     {
         if (Path.GetExtension(node.ProjectInstance.FullPath).Equals(".fsproj", StringComparison.OrdinalIgnoreCase))
@@ -90,5 +131,16 @@ internal sealed record FSharpProjectInfo(
         var value = Environment.GetEnvironmentVariable("DOTNET_WATCH_TRACE_FSHARP_HOTRELOAD");
         return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
                string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeFullPath(string path)
+    {
+        var normalized = path.Trim();
+        if (normalized.Length >= 2 && normalized[0] == '"' && normalized[^1] == '"')
+        {
+            normalized = normalized[1..^1];
+        }
+
+        return Path.GetFullPath(normalized);
     }
 }

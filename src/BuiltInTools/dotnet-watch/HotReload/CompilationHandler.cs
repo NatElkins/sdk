@@ -253,13 +253,23 @@ namespace Microsoft.DotNet.Watch
             var runningProjectInfos =
                (from project in currentSolution.Projects
                 let runningProject = GetCorrespondingRunningProject(project, runningProjects)
-                where runningProject != null
+                where runningProject != null && IsRoslynManagedProject(project)
                 let autoRestartProject = autoRestart || runningProject.ProjectNode.IsAutoRestartEnabled()
                 select (project.Id, info: new WatchHotReloadService.RunningProjectInfo() { RestartWhenChangesHaveNoEffect = autoRestartProject }))
                 .ToImmutableDictionary(e => e.Id, e => e.info);
 
             var updates = await _hotReloadService.GetUpdatesAsync(currentSolution, runningProjectInfos, cancellationToken);
             var fsharpResult = await _fsharpHotReloadService.TryEmitUpdatesAsync(changedFiles, runningProjects, cancellationToken);
+
+            if (fsharpResult.Status == FSharpManagedUpdateStatus.RestartRequired &&
+                !string.IsNullOrEmpty(fsharpResult.Message) &&
+                _logger.IsEnabled(LogLevel.Debug))
+            {
+                _logger.LogDebug(
+                    "F# managed update fallback reason for '{ProjectPath}': {Message}",
+                    fsharpResult.ProjectPath,
+                    fsharpResult.Message);
+            }
 
             await DisplayResultsAsync(updates, runningProjectInfos, cancellationToken);
 
@@ -396,6 +406,9 @@ namespace Microsoft.DotNet.Watch
 
             return projectsWithPath.SingleOrDefault(p => string.Equals(p.ProjectNode.GetTargetFramework(), tfm, StringComparison.OrdinalIgnoreCase));
         }
+
+        private static bool IsRoslynManagedProject(Project project)
+            => project.Language is LanguageNames.CSharp or LanguageNames.VisualBasic;
 
         private async ValueTask DisplayResultsAsync(WatchHotReloadService.Updates2 updates, ImmutableDictionary<ProjectId, WatchHotReloadService.RunningProjectInfo> runningProjectInfos, CancellationToken cancellationToken)
         {
