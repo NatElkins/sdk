@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Collections;
+using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Reflection;
@@ -37,7 +38,7 @@ internal sealed class FSharpHotReloadService
     private ImmutableDictionary<ProjectInstanceId, FSharpProjectInfo> _projects = ImmutableDictionary<ProjectInstanceId, FSharpProjectInfo>.Empty;
     private FSharpReflectionHost? _host;
     private ProjectInstanceId? _activeProject;
-    private object? _activeProjectOptions;
+    private object? _activeProjectInput;
 
     public FSharpHotReloadService(ILogger logger)
     {
@@ -65,9 +66,10 @@ internal sealed class FSharpHotReloadService
     {
         _host?.TryEndSession();
         _activeProject = null;
-        _activeProjectOptions = null;
+        _activeProjectInput = null;
     }
 
+#pragma warning disable CS1998 // Intentional sync fast-path wrapped in ValueTask-returning API.
     public async ValueTask<FSharpManagedUpdateResult> TryEmitUpdatesAsync(
         IReadOnlyList<ChangedFile> changedFiles,
         ImmutableDictionary<string, ImmutableArray<RunningProject>> runningProjects,
@@ -123,8 +125,19 @@ internal sealed class FSharpHotReloadService
         var changedSourceFiles = GetChangedSourceFilesForProject(changedFiles, projectInfo.ProjectId);
         foreach (var changedSourceFile in changedSourceFiles)
         {
-            host.NotifyFileChanged(changedSourceFile, _activeProjectOptions!, cancellationToken);
+            host.NotifyFileChanged(changedSourceFile, _activeProjectInput!, cancellationToken);
         }
+
+        if (!host.TryRefreshProjectInput(projectInfo, _activeProjectInput!, out var refreshedProjectInput, out var refreshMessage))
+        {
+            return new FSharpManagedUpdateResult(
+                FSharpManagedUpdateStatus.RestartRequired,
+                [],
+                projectInfo.ProjectPath,
+                refreshMessage);
+        }
+
+        _activeProjectInput = refreshedProjectInput;
 
         var moduleId = TryGetModuleVersionId(projectInfo.TargetPath);
         if (moduleId == null)
@@ -133,7 +146,7 @@ internal sealed class FSharpHotReloadService
             return new FSharpManagedUpdateResult(FSharpManagedUpdateStatus.RestartRequired, [], projectInfo.ProjectPath, message);
         }
 
-        var emit = host.EmitDelta(_activeProjectOptions!, cancellationToken);
+        var emit = host.EmitDelta(_activeProjectInput!, cancellationToken);
         if (!emit.IsSuccess)
         {
             var mappedStatus = MapErrorStatus(emit.ErrorCase);
@@ -148,7 +161,7 @@ internal sealed class FSharpHotReloadService
                 EndSession();
                 if (EnsureSession(host, projectInfo, out var retryStatus, out var retryMessage))
                 {
-                    emit = host.EmitDelta(_activeProjectOptions!, cancellationToken);
+                    emit = host.EmitDelta(_activeProjectInput!, cancellationToken);
                     if (emit.IsSuccess)
                     {
                         mappedStatus = FSharpManagedUpdateStatus.ReadyToApply;
@@ -215,6 +228,7 @@ internal sealed class FSharpHotReloadService
             projectInfo.ProjectPath,
             null);
     }
+#pragma warning restore CS1998
 
     private ProjectInstanceId? TryGetChangedRunningFSharpProject(
         IReadOnlyList<ChangedFile> changedFiles,
@@ -354,7 +368,7 @@ internal sealed class FSharpHotReloadService
         message = null;
 
         if (_activeProject is { } activeProject &&
-            _activeProjectOptions != null &&
+            _activeProjectInput != null &&
             activeProject.Equals(projectInfo.ProjectId))
         {
             return true;
@@ -362,13 +376,13 @@ internal sealed class FSharpHotReloadService
 
         EndSession();
 
-        if (!host.TryCreateProjectOptions(projectInfo, out var projectOptions, out message))
+        if (!host.TryCreateProjectInput(projectInfo, out var projectInput, out message))
         {
             status = FSharpManagedUpdateStatus.RestartRequired;
             return false;
         }
 
-        var start = host.StartSession(projectOptions!, CancellationToken.None);
+        var start = host.StartSession(projectInput!, CancellationToken.None);
         if (!start.IsSuccess)
         {
             status = MapErrorStatus(start.ErrorCase);
@@ -383,7 +397,7 @@ internal sealed class FSharpHotReloadService
         }
 
         _activeProject = projectInfo.ProjectId;
-        _activeProjectOptions = projectOptions;
+        _activeProjectInput = projectInput;
         return true;
     }
 
@@ -519,6 +533,13 @@ internal sealed class FSharpHotReloadService
         private readonly MethodInfo _emitDelta;
         private readonly MethodInfo _endSession;
         private readonly MethodInfo _runSynchronously;
+        private readonly bool _useWorkspaceSnapshots;
+        private readonly object? _workspaceProjects;
+        private readonly object? _workspaceFiles;
+        private readonly object? _workspaceQuery;
+        private readonly MethodInfo? _workspaceProjectAddOrUpdate;
+        private readonly MethodInfo? _workspaceQueryGetProjectSnapshot;
+        private readonly MethodInfo? _workspaceFilesClose;
 
         private FSharpReflectionHost(
             ILogger logger,
@@ -529,7 +550,14 @@ internal sealed class FSharpHotReloadService
             MethodInfo? notifyFileChanged,
             MethodInfo emitDelta,
             MethodInfo endSession,
-            MethodInfo runSynchronously)
+            MethodInfo runSynchronously,
+            bool useWorkspaceSnapshots,
+            object? workspaceProjects,
+            object? workspaceFiles,
+            object? workspaceQuery,
+            MethodInfo? workspaceProjectAddOrUpdate,
+            MethodInfo? workspaceQueryGetProjectSnapshot,
+            MethodInfo? workspaceFilesClose)
         {
             _logger = logger;
             _trace = trace;
@@ -540,6 +568,13 @@ internal sealed class FSharpHotReloadService
             _emitDelta = emitDelta;
             _endSession = endSession;
             _runSynchronously = runSynchronously;
+            _useWorkspaceSnapshots = useWorkspaceSnapshots;
+            _workspaceProjects = workspaceProjects;
+            _workspaceFiles = workspaceFiles;
+            _workspaceQuery = workspaceQuery;
+            _workspaceProjectAddOrUpdate = workspaceProjectAddOrUpdate;
+            _workspaceQueryGetProjectSnapshot = workspaceQueryGetProjectSnapshot;
+            _workspaceFilesClose = workspaceFilesClose;
         }
 
         public static bool TryCreate(
@@ -580,14 +615,18 @@ internal sealed class FSharpHotReloadService
                 var getProjectOptions = checkerType.GetMethod("GetProjectOptionsFromCommandLineArgs", BindingFlags.Public | BindingFlags.Instance)
                     ?? throw new MissingMethodException(checkerType.FullName, "GetProjectOptionsFromCommandLineArgs");
 
-                var startSession = checkerType.GetMethod("StartHotReloadSession", BindingFlags.Public | BindingFlags.Instance)
-                    ?? throw new MissingMethodException(checkerType.FullName, "StartHotReloadSession");
+                var startSessionMethods = checkerType
+                    .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .Where(method => method.Name == "StartHotReloadSession")
+                    .ToImmutableArray();
 
                 var notifyFileChanged = checkerType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
                     .FirstOrDefault(method => method.Name == "NotifyFileChanged" && method.GetParameters().Length >= 2);
 
-                var emitDelta = checkerType.GetMethod("EmitHotReloadDelta", BindingFlags.Public | BindingFlags.Instance)
-                    ?? throw new MissingMethodException(checkerType.FullName, "EmitHotReloadDelta");
+                var emitDeltaMethods = checkerType
+                    .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .Where(method => method.Name == "EmitHotReloadDelta")
+                    .ToImmutableArray();
 
                 var endSession = checkerType.GetMethod("EndHotReloadSession", BindingFlags.Public | BindingFlags.Instance)
                     ?? throw new MissingMethodException(checkerType.FullName, "EndHotReloadSession");
@@ -596,7 +635,85 @@ internal sealed class FSharpHotReloadService
                 var runSynchronously = fsharpAsyncType.GetMethods(BindingFlags.Public | BindingFlags.Static)
                     .First(method => method.Name == "RunSynchronously" && method.IsGenericMethod && method.GetParameters().Length == 3);
 
-                host = new FSharpReflectionHost(logger, trace, checker, getProjectOptions, startSession, notifyFileChanged, emitDelta, endSession, runSynchronously);
+                var startSessionWithOptions =
+                    startSessionMethods.FirstOrDefault(HasFirstParameterNamedProjectOptions)
+                    ?? startSessionMethods.FirstOrDefault(method => method.GetParameters().Length > 0);
+                var emitDeltaWithOptions =
+                    emitDeltaMethods.FirstOrDefault(HasFirstParameterNamedProjectOptions)
+                    ?? emitDeltaMethods.FirstOrDefault(method => method.GetParameters().Length > 0);
+
+                var projectSnapshotType = assembly.GetType("FSharp.Compiler.CodeAnalysis.ProjectSnapshot+FSharpProjectSnapshot", throwOnError: false);
+                var startSessionWithSnapshot = projectSnapshotType == null
+                    ? null
+                    : startSessionMethods.FirstOrDefault(method => HasFirstParameterType(method, projectSnapshotType));
+                var emitDeltaWithSnapshot = projectSnapshotType == null
+                    ? null
+                    : emitDeltaMethods.FirstOrDefault(method => HasFirstParameterType(method, projectSnapshotType));
+
+                var useWorkspaceSnapshots = false;
+                object? workspaceProjects = null;
+                object? workspaceFiles = null;
+                object? workspaceQuery = null;
+                MethodInfo? workspaceProjectAddOrUpdate = null;
+                MethodInfo? workspaceQueryGetProjectSnapshot = null;
+                MethodInfo? workspaceFilesClose = null;
+                string? workspaceError = null;
+                MethodInfo selectedStartSession;
+                MethodInfo selectedEmitDelta;
+
+                if (startSessionWithSnapshot != null &&
+                    emitDeltaWithSnapshot != null &&
+                    TryCreateWorkspaceBridge(
+                        assembly,
+                        checkerType,
+                        checker,
+                        out workspaceProjects,
+                        out workspaceFiles,
+                        out workspaceQuery,
+                        out workspaceProjectAddOrUpdate,
+                        out workspaceQueryGetProjectSnapshot,
+                        out workspaceFilesClose,
+                        out workspaceError))
+                {
+                    useWorkspaceSnapshots = true;
+                    selectedStartSession = startSessionWithSnapshot;
+                    selectedEmitDelta = emitDeltaWithSnapshot;
+
+                    if (trace)
+                    {
+                        logger.LogDebug("F# managed hot reload is using workspace snapshot bridge.");
+                    }
+                }
+                else
+                {
+                    selectedStartSession = startSessionWithOptions
+                        ?? throw new MissingMethodException(checkerType.FullName, "StartHotReloadSession(projectOptions)");
+                    selectedEmitDelta = emitDeltaWithOptions
+                        ?? throw new MissingMethodException(checkerType.FullName, "EmitHotReloadDelta(projectOptions)");
+
+                    if (trace && !string.IsNullOrEmpty(workspaceError))
+                    {
+                        logger.LogDebug("F# workspace snapshot bridge unavailable, using project-options path: {Message}", workspaceError);
+                    }
+                }
+
+                host = new FSharpReflectionHost(
+                    logger,
+                    trace,
+                    checker,
+                    getProjectOptions,
+                    selectedStartSession,
+                    notifyFileChanged,
+                    selectedEmitDelta,
+                    endSession,
+                    runSynchronously,
+                    useWorkspaceSnapshots,
+                    workspaceProjects,
+                    workspaceFiles,
+                    workspaceQuery,
+                    workspaceProjectAddOrUpdate,
+                    workspaceQueryGetProjectSnapshot,
+                    workspaceFilesClose);
                 return true;
             }
             catch (Exception ex)
@@ -606,34 +723,138 @@ internal sealed class FSharpHotReloadService
             }
         }
 
-        public bool TryCreateProjectOptions(FSharpProjectInfo projectInfo, out object? projectOptions, out string? error)
+        private static bool TryCreateWorkspaceBridge(
+            Assembly assembly,
+            Type checkerType,
+            object checker,
+            out object? workspaceProjects,
+            out object? workspaceFiles,
+            out object? workspaceQuery,
+            out MethodInfo? workspaceProjectAddOrUpdate,
+            out MethodInfo? workspaceQueryGetProjectSnapshot,
+            out MethodInfo? workspaceFilesClose,
+            out string? error)
         {
-            projectOptions = null;
+            workspaceProjects = null;
+            workspaceFiles = null;
+            workspaceQuery = null;
+            workspaceProjectAddOrUpdate = null;
+            workspaceQueryGetProjectSnapshot = null;
+            workspaceFilesClose = null;
             error = null;
 
-            try
+            var workspaceType = assembly.GetType("FSharp.Compiler.CodeAnalysis.Workspace.FSharpWorkspace", throwOnError: false);
+            if (workspaceType == null)
             {
-                var args = projectInfo.CommandLineArgs;
-                if (!args.Any(static arg => string.Equals(arg, "--enable:hotreloaddeltas", StringComparison.OrdinalIgnoreCase)))
-                {
-                    args = args.Add("--enable:hotreloaddeltas");
-                }
-
-                projectOptions = _getProjectOptions.Invoke(_checker, [projectInfo.ProjectPath, args.ToArray(), null, null, null]);
-                return projectOptions != null;
-            }
-            catch (Exception ex)
-            {
-                error = ex.Message;
+                error = "FSharpWorkspace type was not found in FSharp.Compiler.Service.";
                 return false;
             }
+
+            var workspaceCtor = workspaceType.GetConstructor([checkerType]) ?? workspaceType.GetConstructor(Type.EmptyTypes);
+            if (workspaceCtor == null)
+            {
+                error = "FSharpWorkspace constructor was not found.";
+                return false;
+            }
+
+            var workspace = workspaceCtor.GetParameters().Length == 1
+                ? workspaceCtor.Invoke([checker])
+                : workspaceCtor.Invoke([]);
+
+            var projects = workspaceType.GetProperty("Projects", BindingFlags.Public | BindingFlags.Instance)?.GetValue(workspace);
+            var files = workspaceType.GetProperty("Files", BindingFlags.Public | BindingFlags.Instance)?.GetValue(workspace);
+            var query = workspaceType.GetProperty("Query", BindingFlags.Public | BindingFlags.Instance)?.GetValue(workspace);
+
+            if (projects == null || files == null || query == null)
+            {
+                error = "FSharpWorkspace properties (Projects/Files/Query) were not available.";
+                return false;
+            }
+
+            workspaceProjectAddOrUpdate = projects.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(method =>
+                {
+                    if (method.Name != "AddOrUpdate")
+                    {
+                        return false;
+                    }
+
+                    var parameters = method.GetParameters();
+                    return parameters.Length == 3 &&
+                           parameters[0].ParameterType == typeof(string) &&
+                           parameters[1].ParameterType == typeof(string);
+                });
+
+            workspaceQueryGetProjectSnapshot = query.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(method => method.Name == "GetProjectSnapshot" && method.GetParameters().Length == 1);
+
+            workspaceFilesClose = files.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(method =>
+                {
+                    if (method.Name != "Close")
+                    {
+                        return false;
+                    }
+
+                    var parameters = method.GetParameters();
+                    return parameters.Length == 1 && parameters[0].ParameterType == typeof(Uri);
+                });
+
+            if (workspaceProjectAddOrUpdate == null ||
+                workspaceQueryGetProjectSnapshot == null ||
+                workspaceFilesClose == null)
+            {
+                error = "FSharpWorkspace method surface is missing required members.";
+                return false;
+            }
+
+            workspaceProjects = projects;
+            workspaceFiles = files;
+            workspaceQuery = query;
+            return true;
         }
 
-        public FSharpInvocationResult StartSession(object projectOptions, CancellationToken cancellationToken)
-            => InvokeResult(_startSession, [projectOptions, null], cancellationToken);
-
-        public void NotifyFileChanged(string filePath, object projectOptions, CancellationToken cancellationToken)
+        private static bool HasFirstParameterNamedProjectOptions(MethodInfo method)
         {
+            var parameters = method.GetParameters();
+            return parameters.Length > 0 &&
+                   string.Equals(parameters[0].Name, "projectOptions", StringComparison.Ordinal);
+        }
+
+        private static bool HasFirstParameterType(MethodInfo method, Type parameterType)
+        {
+            var parameters = method.GetParameters();
+            return parameters.Length > 0 && parameters[0].ParameterType == parameterType;
+        }
+
+        public bool TryCreateProjectInput(FSharpProjectInfo projectInfo, out object? projectInput, out string? error)
+            => _useWorkspaceSnapshots
+                ? TryCreateWorkspaceSnapshotInput(projectInfo, out projectInput, out error)
+                : TryCreateProjectOptionsInput(projectInfo, out projectInput, out error);
+
+        public bool TryRefreshProjectInput(FSharpProjectInfo projectInfo, object currentProjectInput, out object? refreshedProjectInput, out string? error)
+        {
+            if (_useWorkspaceSnapshots)
+            {
+                return TryCreateWorkspaceSnapshotInput(projectInfo, out refreshedProjectInput, out error);
+            }
+
+            refreshedProjectInput = currentProjectInput;
+            error = null;
+            return true;
+        }
+
+        public FSharpInvocationResult StartSession(object projectInput, CancellationToken cancellationToken)
+            => InvokeResult(_startSession, [projectInput, null], cancellationToken);
+
+        public void NotifyFileChanged(string filePath, object projectInput, CancellationToken cancellationToken)
+        {
+            if (_useWorkspaceSnapshots)
+            {
+                NotifyWorkspaceFileChanged(filePath);
+                return;
+            }
+
             if (_notifyFileChanged == null)
             {
                 return;
@@ -641,7 +862,7 @@ internal sealed class FSharpHotReloadService
 
             try
             {
-                var asyncComputation = _notifyFileChanged.Invoke(_checker, [filePath, projectOptions, null]);
+                var asyncComputation = _notifyFileChanged.Invoke(_checker, [filePath, projectInput, null]);
                 if (asyncComputation == null)
                 {
                     return;
@@ -661,8 +882,94 @@ internal sealed class FSharpHotReloadService
             }
         }
 
-        public FSharpInvocationResult EmitDelta(object projectOptions, CancellationToken cancellationToken)
-            => InvokeResult(_emitDelta, [projectOptions, null], cancellationToken);
+        public FSharpInvocationResult EmitDelta(object projectInput, CancellationToken cancellationToken)
+            => InvokeResult(_emitDelta, [projectInput, null], cancellationToken);
+
+        private bool TryCreateProjectOptionsInput(FSharpProjectInfo projectInfo, out object? projectInput, out string? error)
+        {
+            projectInput = null;
+            error = null;
+
+            try
+            {
+                var args = EnsureHotReloadFlag(projectInfo.CommandLineArgs);
+                projectInput = _getProjectOptions.Invoke(_checker, [projectInfo.ProjectPath, args.ToArray(), null, null, null]);
+                return projectInput != null;
+            }
+            catch (Exception ex)
+            {
+                var rootException = (ex as TargetInvocationException)?.InnerException ?? ex.GetBaseException();
+                error = rootException.Message;
+                return false;
+            }
+        }
+
+        private bool TryCreateWorkspaceSnapshotInput(FSharpProjectInfo projectInfo, out object? projectInput, out string? error)
+        {
+            projectInput = null;
+            error = null;
+
+            if (_workspaceProjects == null ||
+                _workspaceQuery == null ||
+                _workspaceProjectAddOrUpdate == null ||
+                _workspaceQueryGetProjectSnapshot == null)
+            {
+                error = "FSharpWorkspace bridge is not initialized.";
+                return false;
+            }
+
+            try
+            {
+                var args = EnsureHotReloadFlag(projectInfo.CommandLineArgs);
+                var projectIdentifier = _workspaceProjectAddOrUpdate.Invoke(
+                    _workspaceProjects,
+                    [projectInfo.ProjectPath, projectInfo.TargetPath, args.ToArray()]);
+
+                if (projectIdentifier == null)
+                {
+                    error = $"FSharpWorkspace.Projects.AddOrUpdate returned null for '{projectInfo.ProjectPath}'.";
+                    return false;
+                }
+
+                var snapshotOption = _workspaceQueryGetProjectSnapshot.Invoke(_workspaceQuery, [projectIdentifier]);
+                if (!TryGetFSharpOptionValue(snapshotOption, out var snapshot))
+                {
+                    error = $"FSharpWorkspace.Query.GetProjectSnapshot returned None for '{projectInfo.ProjectPath}'.";
+                    return false;
+                }
+
+                projectInput = snapshot;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                var rootException = (ex as TargetInvocationException)?.InnerException ?? ex.GetBaseException();
+                error = rootException.Message;
+                return false;
+            }
+        }
+
+        private void NotifyWorkspaceFileChanged(string filePath)
+        {
+            if (_workspaceFiles == null || _workspaceFilesClose == null)
+            {
+                return;
+            }
+
+            try
+            {
+                var normalizedPath = Path.GetFullPath(filePath);
+                _workspaceFilesClose.Invoke(_workspaceFiles, [new Uri(normalizedPath)]);
+            }
+            catch (Exception ex)
+            {
+                if (_trace)
+                {
+                    var rootException = (ex as TargetInvocationException)?.InnerException ?? ex.GetBaseException();
+                    _logger.LogDebug("F# workspace file refresh failed for '{FilePath}': {Message}", filePath, rootException.Message);
+                }
+            }
+        }
 
         public HotReloadManagedCodeUpdate? CreateManagedUpdate(Guid moduleId, object delta)
         {
@@ -741,6 +1048,36 @@ internal sealed class FSharpHotReloadService
                 var rootException = (ex as TargetInvocationException)?.InnerException ?? ex.GetBaseException();
                 return new FSharpInvocationResult(false, null, null, rootException.Message);
             }
+        }
+
+        private static ImmutableArray<string> EnsureHotReloadFlag(ImmutableArray<string> args)
+            => args.Any(static arg => string.Equals(arg, "--enable:hotreloaddeltas", StringComparison.OrdinalIgnoreCase))
+                ? args
+                : args.Add("--enable:hotreloaddeltas");
+
+        private static bool TryGetFSharpOptionValue(object? option, out object? value)
+        {
+            value = null;
+            if (option == null)
+            {
+                return false;
+            }
+
+            var optionType = option.GetType();
+            var isSomeProperty = optionType.GetProperty("IsSome", BindingFlags.Public | BindingFlags.Instance);
+            var valueProperty = optionType.GetProperty("Value", BindingFlags.Public | BindingFlags.Instance);
+            if (isSomeProperty == null || valueProperty == null)
+            {
+                return false;
+            }
+
+            if (isSomeProperty.GetValue(option) is not bool isSome || !isSome)
+            {
+                return false;
+            }
+
+            value = valueProperty.GetValue(option);
+            return value != null;
         }
 
         private static string? ParseErrorCase(string? text)
