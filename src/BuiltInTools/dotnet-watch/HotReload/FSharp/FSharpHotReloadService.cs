@@ -125,7 +125,7 @@ internal sealed class FSharpHotReloadService
         var changedSourceFiles = GetChangedSourceFilesForProject(changedFiles, projectInfo.ProjectId);
         foreach (var changedSourceFile in changedSourceFiles)
         {
-            host.NotifyFileChanged(changedSourceFile, _activeProjectInput!, cancellationToken);
+            host.NotifyFileChanged(changedSourceFile, projectInfo, _activeProjectInput!, cancellationToken);
         }
 
         if (!host.TryRefreshProjectInput(projectInfo, _activeProjectInput!, out var refreshedProjectInput, out var refreshMessage))
@@ -179,6 +179,26 @@ internal sealed class FSharpHotReloadService
 
             if (mappedStatus == FSharpManagedUpdateStatus.NoChanges)
             {
+                if (!changedSourceFiles.IsEmpty)
+                {
+                    var message = "F# managed update produced no semantic delta for edited source files.";
+
+                    if (_trace)
+                    {
+                        _logger.LogDebug(
+                            "{Message} Project='{ProjectPath}', Files='{ChangedFiles}'",
+                            message,
+                            projectInfo.ProjectPath,
+                            string.Join(", ", changedSourceFiles));
+                    }
+
+                    return new FSharpManagedUpdateResult(
+                        FSharpManagedUpdateStatus.RestartRequired,
+                        [],
+                        projectInfo.ProjectPath,
+                        message);
+                }
+
                 return new FSharpManagedUpdateResult(FSharpManagedUpdateStatus.NoChanges, [], null, null);
             }
 
@@ -539,6 +559,7 @@ internal sealed class FSharpHotReloadService
         private readonly object? _workspaceQuery;
         private readonly MethodInfo? _workspaceProjectAddOrUpdate;
         private readonly MethodInfo? _workspaceQueryGetProjectSnapshot;
+        private readonly MethodInfo? _workspaceFilesEdit;
         private readonly MethodInfo? _workspaceFilesClose;
 
         private FSharpReflectionHost(
@@ -557,6 +578,7 @@ internal sealed class FSharpHotReloadService
             object? workspaceQuery,
             MethodInfo? workspaceProjectAddOrUpdate,
             MethodInfo? workspaceQueryGetProjectSnapshot,
+            MethodInfo? workspaceFilesEdit,
             MethodInfo? workspaceFilesClose)
         {
             _logger = logger;
@@ -574,6 +596,7 @@ internal sealed class FSharpHotReloadService
             _workspaceQuery = workspaceQuery;
             _workspaceProjectAddOrUpdate = workspaceProjectAddOrUpdate;
             _workspaceQueryGetProjectSnapshot = workspaceQueryGetProjectSnapshot;
+            _workspaceFilesEdit = workspaceFilesEdit;
             _workspaceFilesClose = workspaceFilesClose;
         }
 
@@ -587,7 +610,8 @@ internal sealed class FSharpHotReloadService
             host = null!;
             error = null;
 
-            var servicePath = Environment.GetEnvironmentVariable("DOTNET_WATCH_FSHARP_COMPILER_SERVICE_PATH");
+            var servicePathOverride = Environment.GetEnvironmentVariable("DOTNET_WATCH_FSHARP_COMPILER_SERVICE_PATH");
+            var servicePath = servicePathOverride;
             if (string.IsNullOrEmpty(servicePath))
             {
                 var compilerDirectory = Path.GetDirectoryName(projectInfo.DotnetFscCompilerPath);
@@ -656,12 +680,15 @@ internal sealed class FSharpHotReloadService
                 object? workspaceQuery = null;
                 MethodInfo? workspaceProjectAddOrUpdate = null;
                 MethodInfo? workspaceQueryGetProjectSnapshot = null;
+                MethodInfo? workspaceFilesEdit = null;
                 MethodInfo? workspaceFilesClose = null;
                 string? workspaceError = null;
                 MethodInfo selectedStartSession;
                 MethodInfo selectedEmitDelta;
+                var preferWorkspaceSnapshots = ShouldPreferWorkspaceSnapshots(servicePathOverride);
 
-                if (startSessionWithSnapshot != null &&
+                if (preferWorkspaceSnapshots &&
+                    startSessionWithSnapshot != null &&
                     emitDeltaWithSnapshot != null &&
                     TryCreateWorkspaceBridge(
                         assembly,
@@ -672,6 +699,7 @@ internal sealed class FSharpHotReloadService
                         out workspaceQuery,
                         out workspaceProjectAddOrUpdate,
                         out workspaceQueryGetProjectSnapshot,
+                        out workspaceFilesEdit,
                         out workspaceFilesClose,
                         out workspaceError))
                 {
@@ -695,6 +723,11 @@ internal sealed class FSharpHotReloadService
                     {
                         logger.LogDebug("F# workspace snapshot bridge unavailable, using project-options path: {Message}", workspaceError);
                     }
+                    else if (trace && !preferWorkspaceSnapshots && startSessionWithSnapshot != null && emitDeltaWithSnapshot != null)
+                    {
+                        logger.LogDebug(
+                            "F# workspace snapshot bridge is disabled by default for bundled compiler service builds. Set DOTNET_WATCH_FSHARP_USE_WORKSPACE_SNAPSHOTS=1 to force-enable it.");
+                    }
                 }
 
                 host = new FSharpReflectionHost(
@@ -713,6 +746,7 @@ internal sealed class FSharpHotReloadService
                     workspaceQuery,
                     workspaceProjectAddOrUpdate,
                     workspaceQueryGetProjectSnapshot,
+                    workspaceFilesEdit,
                     workspaceFilesClose);
                 return true;
             }
@@ -721,6 +755,20 @@ internal sealed class FSharpHotReloadService
                 error = ex.Message;
                 return false;
             }
+        }
+
+        private static bool ShouldPreferWorkspaceSnapshots(string? servicePathOverride)
+        {
+            var overrideValue = Environment.GetEnvironmentVariable("DOTNET_WATCH_FSHARP_USE_WORKSPACE_SNAPSHOTS");
+            if (!string.IsNullOrEmpty(overrideValue))
+            {
+                return string.Equals(overrideValue, "1", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(overrideValue, "true", StringComparison.OrdinalIgnoreCase);
+            }
+
+            // Default to project-options mode for bundled SDK bits and enable workspace snapshots
+            // when the user explicitly points watch at a custom FSharp.Compiler.Service build.
+            return !string.IsNullOrEmpty(servicePathOverride);
         }
 
         private static bool TryCreateWorkspaceBridge(
@@ -732,6 +780,7 @@ internal sealed class FSharpHotReloadService
             out object? workspaceQuery,
             out MethodInfo? workspaceProjectAddOrUpdate,
             out MethodInfo? workspaceQueryGetProjectSnapshot,
+            out MethodInfo? workspaceFilesEdit,
             out MethodInfo? workspaceFilesClose,
             out string? error)
         {
@@ -740,6 +789,7 @@ internal sealed class FSharpHotReloadService
             workspaceQuery = null;
             workspaceProjectAddOrUpdate = null;
             workspaceQueryGetProjectSnapshot = null;
+            workspaceFilesEdit = null;
             workspaceFilesClose = null;
             error = null;
 
@@ -788,6 +838,20 @@ internal sealed class FSharpHotReloadService
             workspaceQueryGetProjectSnapshot = query.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
                 .FirstOrDefault(method => method.Name == "GetProjectSnapshot" && method.GetParameters().Length == 1);
 
+            workspaceFilesEdit = files.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(method =>
+                {
+                    if (method.Name != "Edit")
+                    {
+                        return false;
+                    }
+
+                    var parameters = method.GetParameters();
+                    return parameters.Length == 2 &&
+                           parameters[0].ParameterType == typeof(Uri) &&
+                           parameters[1].ParameterType == typeof(string);
+                });
+
             workspaceFilesClose = files.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
                 .FirstOrDefault(method =>
                 {
@@ -802,7 +866,7 @@ internal sealed class FSharpHotReloadService
 
             if (workspaceProjectAddOrUpdate == null ||
                 workspaceQueryGetProjectSnapshot == null ||
-                workspaceFilesClose == null)
+                (workspaceFilesEdit == null && workspaceFilesClose == null))
             {
                 error = "FSharpWorkspace method surface is missing required members.";
                 return false;
@@ -847,14 +911,30 @@ internal sealed class FSharpHotReloadService
         public FSharpInvocationResult StartSession(object projectInput, CancellationToken cancellationToken)
             => InvokeResult(_startSession, [projectInput, null], cancellationToken);
 
-        public void NotifyFileChanged(string filePath, object projectInput, CancellationToken cancellationToken)
+        public void NotifyFileChanged(string filePath, FSharpProjectInfo projectInfo, object projectInput, CancellationToken cancellationToken)
         {
             if (_useWorkspaceSnapshots)
             {
                 NotifyWorkspaceFileChanged(filePath);
+                NotifyCheckerFileChanged(filePath, projectInfo);
                 return;
             }
 
+            NotifyCheckerFileChanged(filePath, projectInput);
+        }
+
+        private void NotifyCheckerFileChanged(string filePath, FSharpProjectInfo projectInfo)
+        {
+            if (!TryCreateProjectOptionsInput(projectInfo, out var projectOptions, out _))
+            {
+                return;
+            }
+
+            NotifyCheckerFileChanged(filePath, projectOptions);
+        }
+
+        private void NotifyCheckerFileChanged(string filePath, object? projectInput)
+        {
             if (_notifyFileChanged == null)
             {
                 return;
@@ -938,6 +1018,12 @@ internal sealed class FSharpHotReloadService
                     return false;
                 }
 
+                if (snapshot == null)
+                {
+                    error = $"FSharpWorkspace.Query.GetProjectSnapshot returned Some(null) for '{projectInfo.ProjectPath}'.";
+                    return false;
+                }
+
                 projectInput = snapshot;
                 return true;
             }
@@ -951,7 +1037,7 @@ internal sealed class FSharpHotReloadService
 
         private void NotifyWorkspaceFileChanged(string filePath)
         {
-            if (_workspaceFiles == null || _workspaceFilesClose == null)
+            if (_workspaceFiles == null || (_workspaceFilesEdit == null && _workspaceFilesClose == null))
             {
                 return;
             }
@@ -959,7 +1045,16 @@ internal sealed class FSharpHotReloadService
             try
             {
                 var normalizedPath = Path.GetFullPath(filePath);
-                _workspaceFilesClose.Invoke(_workspaceFiles, [new Uri(normalizedPath)]);
+                var fileUri = new Uri(normalizedPath);
+
+                if (_workspaceFilesEdit != null)
+                {
+                    var content = File.ReadAllText(normalizedPath);
+                    _workspaceFilesEdit.Invoke(_workspaceFiles, [fileUri, content]);
+                    return;
+                }
+
+                _workspaceFilesClose!.Invoke(_workspaceFiles, [fileUri]);
             }
             catch (Exception ex)
             {
@@ -1064,21 +1159,29 @@ internal sealed class FSharpHotReloadService
             }
 
             var optionType = option.GetType();
-            var isSomeProperty = optionType.GetProperty("IsSome", BindingFlags.Public | BindingFlags.Instance);
-            var valueProperty = optionType.GetProperty("Value", BindingFlags.Public | BindingFlags.Instance);
-            if (isSomeProperty == null || valueProperty == null)
+            var isSomeAccessor = optionType.GetMethod("get_IsSome", BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static);
+            var valueAccessor = optionType.GetMethod("get_Value", BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static);
+            if (isSomeAccessor == null || valueAccessor == null)
             {
                 return false;
             }
 
-            if (isSomeProperty.GetValue(option) is not bool isSome || !isSome)
+            if (InvokeFSharpOptionAccessor(isSomeAccessor, option) is not bool isSome || !isSome)
             {
                 return false;
             }
 
-            value = valueProperty.GetValue(option);
-            return value != null;
+            value = InvokeFSharpOptionAccessor(valueAccessor, option);
+            return true;
         }
+
+        private static object? InvokeFSharpOptionAccessor(MethodInfo accessor, object option)
+            => accessor.GetParameters().Length switch
+            {
+                0 => accessor.Invoke(option, null),
+                1 => accessor.Invoke(null, [option]),
+                _ => throw new InvalidOperationException($"Unexpected option accessor shape: {accessor}")
+            };
 
         private static string? ParseErrorCase(string? text)
         {
