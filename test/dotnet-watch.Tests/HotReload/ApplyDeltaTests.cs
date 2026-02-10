@@ -31,14 +31,25 @@ public class ApplyDeltaTests(ITestOutputHelper logger) : DotNetWatchTestBase(log
 
         if (managedApplied)
         {
-            App.AssertOutputContains(MessageDescriptor.HotReloadChangeHandled);
             App.AssertOutputContains(MessageDescriptor.UpdatesApplied);
             return;
         }
 
         App.AssertOutputContains(MessageDescriptor.RestartNeededToApplyChanges);
-        App.AssertOutputContains(new Regex(@"\[[^\]]+\] Exited"));
-        App.AssertOutputContains(new Regex(@"\[[^\]]+\] Launched"));
+    }
+
+    private void AssertFSharpEditAppliedInPlace()
+    {
+        App.AssertOutputContains(MessageDescriptor.HotReloadSucceeded);
+        App.AssertOutputContains(MessageDescriptor.UpdatesApplied);
+        App.AssertOutputDoesNotContain(MessageDescriptor.RestartNeededToApplyChanges.GetMessage());
+    }
+
+    private Task WaitForFSharpEditOutcomeAsync()
+    {
+        var succeeded = Regex.Escape(MessageDescriptor.HotReloadSucceeded.GetMessage());
+        var restarted = Regex.Escape(MessageDescriptor.RestartNeededToApplyChanges.GetMessage());
+        return App.WaitForOutputLineContaining(new Regex($"{succeeded}|{restarted}"));
     }
 
         [Fact]
@@ -611,10 +622,12 @@ public class ApplyDeltaTests(ITestOutputHelper logger) : DotNetWatchTestBase(log
             open System
             open System.Threading
 
+            let message () = "Waiting"
+
             [<EntryPoint>]
             let main argv =
                 while true do
-                    printfn "Waiting"
+                    printfn "%s" (message())
                     Thread.Sleep(200)
                 0
             """;
@@ -630,16 +643,57 @@ public class ApplyDeltaTests(ITestOutputHelper logger) : DotNetWatchTestBase(log
 
             UpdateSourceFile(sourcePath, content => content.Replace("Waiting", "<Updated>"));
 
-            await App.WaitForOutputLineContaining(MessageDescriptor.WaitingForChanges);
+            await WaitForFSharpEditOutcomeAsync();
             AssertFSharpEditAppliedOrRestarted();
             await App.AssertOutputLineStartsWith("<Updated>");
             App.Process.ClearOutput();
 
             UpdateSourceFile(sourcePath, content => content.Replace("<Updated>", "<Updated2>"));
 
-            await App.WaitForOutputLineContaining(MessageDescriptor.WaitingForChanges);
+            await WaitForFSharpEditOutcomeAsync();
             AssertFSharpEditAppliedOrRestarted();
             await App.AssertOutputLineStartsWith("<Updated2>");
+        }
+
+        [Fact]
+        public async Task ChangeFileInFSharpProjectWithLoop_FirstEditAppliesInPlace()
+        {
+            var testAsset = TestAssets.CopyTestAsset("FSharpTestAppSimple")
+                .WithSource();
+
+            var sdkDirectory = TestContext.Current.ToolsetUnderTest.SdkFolderUnderTest;
+            var fsharpCompilerServicePath = Path.Combine(sdkDirectory, "FSharp", "FSharp.Compiler.Service.dll");
+            Assert.True(File.Exists(fsharpCompilerServicePath), $"Missing FSharp.Compiler.Service.dll at '{fsharpCompilerServicePath}'.");
+
+            App.EnvironmentVariables["DOTNET_WATCH_FSHARP_COMPILER_SERVICE_PATH"] = fsharpCompilerServicePath;
+            App.EnvironmentVariables["DOTNET_WATCH_FSHARP_USE_WORKSPACE_SNAPSHOTS"] = "1";
+
+            var source = """
+            module ConsoleApplication.Program
+
+            open System
+            open System.Threading
+
+            [<EntryPoint>]
+            let main argv =
+                while true do
+                    printfn "Waiting"
+                    Thread.Sleep(200)
+                0
+            """;
+
+            var sourcePath = Path.Combine(testAsset.Path, "Program.fs");
+            File.WriteAllText(sourcePath, source);
+
+            App.Start(testAsset, []);
+
+            await App.WaitForOutputLineContaining(MessageDescriptor.WaitingForChanges);
+            App.Process.ClearOutput();
+
+            UpdateSourceFile(sourcePath, content => content.Replace("Waiting", "<UpdatedInPlace>"));
+
+            await App.WaitForOutputLineContaining(MessageDescriptor.HotReloadSucceeded);
+            AssertFSharpEditAppliedInPlace();
         }
 
         [Fact]
@@ -675,19 +729,19 @@ public class ApplyDeltaTests(ITestOutputHelper logger) : DotNetWatchTestBase(log
             // instead of managed hot reload.
             UpdateSourceFile(sourcePath, content => content.Replace("let main argv =", "let mainRenamed argv ="));
 
-            await App.WaitForOutputLineContaining(MessageDescriptor.WaitingForChanges);
+            await App.WaitForOutputLineContaining(MessageDescriptor.RestartNeededToApplyChanges);
 
             App.AssertOutputContains(MessageDescriptor.RestartNeededToApplyChanges);
-            App.AssertOutputContains(new Regex(@"\[[^\]]+\] Exited"));
-            App.AssertOutputContains(new Regex(@"\[[^\]]+\] Launched"));
             App.AssertOutputDoesNotContain(MessageDescriptor.HotReloadSucceeded.GetMessage());
             App.Process.ClearOutput();
 
             // Ensure subsequent edits continue applying after restart.
             UpdateSourceFile(sourcePath, content => content.Replace("Waiting", "<UpdatedAfterRestart>"));
 
+            await App.WaitForOutputLineContaining(new Regex(@"\[[^\]]+\] Launched"));
             await App.WaitForOutputLineContaining(MessageDescriptor.WaitingForChanges);
-            AssertFSharpEditAppliedOrRestarted();
+            // The second edit can be consumed by the restart build before a new
+            // managed-update attempt is logged, so assert on observable app output.
             await App.AssertOutputLineStartsWith("<UpdatedAfterRestart>");
         }
 

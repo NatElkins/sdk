@@ -12,10 +12,10 @@ internal static class EnvironmentVariables
 
         public const string DotnetLaunchProfile = "DOTNET_LAUNCH_PROFILE";
 
-        public const string DotNetWatchHotReloadNamedPipeName = HotReload.AgentEnvironmentVariables.DotNetWatchHotReloadNamedPipeName;
-        public const string DotNetStartupHooks = HotReload.AgentEnvironmentVariables.DotNetStartupHooks;
-        public const string DotNetModifiableAssemblies = HotReload.AgentEnvironmentVariables.DotNetModifiableAssemblies;
-        public const string HotReloadDeltaClientLogMessages = HotReload.AgentEnvironmentVariables.HotReloadDeltaClientLogMessages;
+        public const string DotNetWatchHotReloadNamedPipeName = Microsoft.DotNet.HotReload.AgentEnvironmentVariables.DotNetWatchHotReloadNamedPipeName;
+        public const string DotNetStartupHooks = Microsoft.DotNet.HotReload.AgentEnvironmentVariables.DotNetStartupHooks;
+        public const string DotNetModifiableAssemblies = Microsoft.DotNet.HotReload.AgentEnvironmentVariables.DotNetModifiableAssemblies;
+        public const string HotReloadDeltaClientLogMessages = Microsoft.DotNet.HotReload.AgentEnvironmentVariables.HotReloadDeltaClientLogMessages;
 
         public const string SuppressBrowserRefresh = "DOTNET_WATCH_SUPPRESS_BROWSER_REFRESH";
     }

@@ -5,6 +5,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
+using System.Linq;
 using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
@@ -36,6 +37,8 @@ internal sealed class FSharpHotReloadService
     private readonly bool _trace;
 
     private ImmutableDictionary<ProjectInstanceId, FSharpProjectInfo> _projects = ImmutableDictionary<ProjectInstanceId, FSharpProjectInfo>.Empty;
+    private ImmutableDictionary<ProjectInstanceId, object> _cachedProjectInputs = ImmutableDictionary<ProjectInstanceId, object>.Empty;
+    private ImmutableDictionary<ProjectInstanceId, Guid> _runtimeModuleIds = ImmutableDictionary<ProjectInstanceId, Guid>.Empty;
     private FSharpReflectionHost? _host;
     private ProjectInstanceId? _activeProject;
     private object? _activeProjectInput;
@@ -49,6 +52,8 @@ internal sealed class FSharpHotReloadService
     public void UpdateProjects(ProjectGraph projectGraph)
     {
         _projects = FSharpProjectInfo.Collect(projectGraph, _logger);
+        _cachedProjectInputs = _cachedProjectInputs.RemoveRange(_cachedProjectInputs.Keys.Where(key => !_projects.ContainsKey(key)));
+        _runtimeModuleIds = _runtimeModuleIds.RemoveRange(_runtimeModuleIds.Keys.Where(key => !_projects.ContainsKey(key)));
 
         if (_activeProject is { } activeProject && !_projects.ContainsKey(activeProject))
         {
@@ -58,12 +63,85 @@ internal sealed class FSharpHotReloadService
 
     public ValueTask StartSessionAsync(CancellationToken cancellationToken)
     {
-        // Session bootstrap is deferred until the first F# managed update request.
+        // Prime per-project inputs from the baseline build before edits arrive.
+        // This mirrors Roslyn's committed-solution model where the first edit is compared
+        // against the last built state rather than being used as the session baseline.
+        var cachedInputsBuilder = ImmutableDictionary.CreateBuilder<ProjectInstanceId, object>();
+
+        foreach (var projectInfo in _projects.Values)
+        {
+            if (!TryGetHost(projectInfo, out var host, out var hostError))
+            {
+                if (_trace)
+                {
+                    _logger.LogDebug(
+                        "Skipping F# project input bootstrap for '{ProjectPath}': {Message}",
+                        projectInfo.ProjectPath,
+                        hostError);
+                }
+
+                continue;
+            }
+
+            if (!host.TryCreateProjectInput(projectInfo, out var projectInput, out var inputError) || projectInput == null)
+            {
+                if (_trace)
+                {
+                    _logger.LogDebug(
+                        "Skipping F# project input bootstrap for '{ProjectPath}': {Message}",
+                        projectInfo.ProjectPath,
+                        inputError ?? "Project input was null.");
+                }
+
+                continue;
+            }
+
+            cachedInputsBuilder[projectInfo.ProjectId] = projectInput;
+        }
+
+        _cachedProjectInputs = cachedInputsBuilder.ToImmutable();
+        _runtimeModuleIds = ImmutableDictionary<ProjectInstanceId, Guid>.Empty;
+
+        if (_projects.Count == 1)
+        {
+            var projectInfo = _projects.Values.First();
+            if (TryGetHost(projectInfo, out var host, out var hostError))
+            {
+                if (!EnsureSession(host, projectInfo, out var status, out var message))
+                {
+                    if (_trace)
+                    {
+                        _logger.LogDebug(
+                            "Unable to prestart F# hot reload session for '{ProjectPath}': {Status} ({Message})",
+                            projectInfo.ProjectPath,
+                            status,
+                            message);
+                    }
+                }
+                else if (_trace)
+                {
+                    _logger.LogDebug("F# hot reload session prestarted for '{ProjectPath}'.", projectInfo.ProjectPath);
+                }
+            }
+            else if (_trace)
+            {
+                _logger.LogDebug(
+                    "Unable to prestart F# hot reload session for '{ProjectPath}': {Message}",
+                    projectInfo.ProjectPath,
+                    hostError);
+            }
+        }
+
         return ValueTask.CompletedTask;
     }
 
     public void EndSession()
     {
+        if (_activeProject is { } activeProject)
+        {
+            _runtimeModuleIds = _runtimeModuleIds.Remove(activeProject);
+        }
+
         _host?.TryEndSession();
         _activeProject = null;
         _activeProjectInput = null;
@@ -117,6 +195,7 @@ internal sealed class FSharpHotReloadService
             return new FSharpManagedUpdateResult(ensureStatus, [], projectInfo.ProjectPath, ensureMessage);
         }
 
+        var moduleIdBeforeCompile = TryGetModuleVersionId(projectInfo.TargetPath);
         if (!TryCompileProjectOutput(projectInfo, out var compileMessage))
         {
             return new FSharpManagedUpdateResult(FSharpManagedUpdateStatus.Blocked, [], projectInfo.ProjectPath, compileMessage);
@@ -138,12 +217,51 @@ internal sealed class FSharpHotReloadService
         }
 
         _activeProjectInput = refreshedProjectInput;
+        _cachedProjectInputs = _cachedProjectInputs.SetItem(projectInfo.ProjectId, refreshedProjectInput!);
 
-        var moduleId = TryGetModuleVersionId(projectInfo.TargetPath);
-        if (moduleId == null)
+        var moduleIdAfterCompile = TryGetModuleVersionId(projectInfo.TargetPath);
+        var targetModuleId =
+            _runtimeModuleIds.TryGetValue(projectInfo.ProjectId, out var runtimeModuleId)
+                ? runtimeModuleId
+                : moduleIdBeforeCompile ?? moduleIdAfterCompile;
+        if (targetModuleId == null)
         {
             var message = $"Unable to read module id from '{projectInfo.TargetPath}'.";
             return new FSharpManagedUpdateResult(FSharpManagedUpdateStatus.RestartRequired, [], projectInfo.ProjectPath, message);
+        }
+
+        if (_trace)
+        {
+            if (moduleIdBeforeCompile == null)
+            {
+                _logger.LogDebug(
+                    "F# target module id for '{ProjectPath}' was unavailable before forced compile; post-compile id={ModuleId}.",
+                    projectInfo.ProjectPath,
+                    moduleIdAfterCompile);
+            }
+            else if (moduleIdAfterCompile == null)
+            {
+                _logger.LogDebug(
+                    "F# target module id unavailable after forced compile for '{ProjectPath}'; using pre-compile id={ModuleId}.",
+                    projectInfo.ProjectPath,
+                    moduleIdBeforeCompile.Value);
+            }
+            else if (moduleIdBeforeCompile != moduleIdAfterCompile.Value)
+            {
+                _logger.LogDebug(
+                    "F# target module id changed after forced compile for '{ProjectPath}': before={BeforeModuleId}, after={AfterModuleId}; targeting loaded module id={TargetModuleId}.",
+                    projectInfo.ProjectPath,
+                    moduleIdBeforeCompile.Value,
+                    moduleIdAfterCompile.Value,
+                    targetModuleId.Value);
+            }
+            else
+            {
+                _logger.LogDebug(
+                    "F# target module id for '{ProjectPath}' is stable across forced compile: {ModuleId}.",
+                    projectInfo.ProjectPath,
+                    targetModuleId.Value);
+            }
         }
 
         var emit = host.EmitDelta(_activeProjectInput!, cancellationToken);
@@ -219,10 +337,15 @@ internal sealed class FSharpHotReloadService
                     emit.ErrorText);
             }
 
+            if (mappedStatus == FSharpManagedUpdateStatus.RestartRequired || mappedStatus == FSharpManagedUpdateStatus.Blocked)
+            {
+                _runtimeModuleIds = _runtimeModuleIds.Remove(projectInfo.ProjectId);
+            }
+
             return new FSharpManagedUpdateResult(mappedStatus, [], projectInfo.ProjectPath, emit.ErrorText);
         }
 
-        var update = host.CreateManagedUpdate(moduleId.Value, emit.Value!);
+        var update = host.CreateManagedUpdate(targetModuleId.Value, emit.Value!);
         if (update == null)
         {
             return new FSharpManagedUpdateResult(
@@ -241,6 +364,8 @@ internal sealed class FSharpHotReloadService
                 update.Value.ILDelta.Length,
                 update.Value.PdbDelta.Length);
         }
+
+        _runtimeModuleIds = _runtimeModuleIds.SetItem(projectInfo.ProjectId, targetModuleId.Value);
 
         return new FSharpManagedUpdateResult(
             FSharpManagedUpdateStatus.ReadyToApply,
@@ -396,7 +521,8 @@ internal sealed class FSharpHotReloadService
 
         EndSession();
 
-        if (!host.TryCreateProjectInput(projectInfo, out var projectInput, out message))
+        if (!_cachedProjectInputs.TryGetValue(projectInfo.ProjectId, out var projectInput) &&
+            !host.TryCreateProjectInput(projectInfo, out projectInput, out message))
         {
             status = FSharpManagedUpdateStatus.RestartRequired;
             return false;
@@ -418,6 +544,7 @@ internal sealed class FSharpHotReloadService
 
         _activeProject = projectInfo.ProjectId;
         _activeProjectInput = projectInput;
+        _cachedProjectInputs = _cachedProjectInputs.SetItem(projectInfo.ProjectId, projectInput!);
         return true;
     }
 
@@ -487,10 +614,6 @@ internal sealed class FSharpHotReloadService
         try
         {
             var projectDirectory = Path.GetDirectoryName(projectInfo.ProjectPath) ?? Directory.GetCurrentDirectory();
-            var forcedOutputPath = Path.Combine(
-                projectDirectory,
-                "obj",
-                $".dotnet-watch-fsharp-emit-{Guid.NewGuid():N}.tmp");
 
             var dotnetHostPath =
                 Environment.ProcessPath ??
@@ -506,17 +629,18 @@ internal sealed class FSharpHotReloadService
                 UseShellExecute = false,
             };
 
-            startInfo.ArgumentList.Add("msbuild");
+            // Use full build semantics so F# project outputs (DLL/PDB) are refreshed for delta emission.
+            // -t:Compile can leave HotReload target outputs stale for SDK-style F# projects.
+            startInfo.ArgumentList.Add("build");
             startInfo.ArgumentList.Add(projectInfo.ProjectPath);
             startInfo.ArgumentList.Add("-nologo");
-            startInfo.ArgumentList.Add("-t:Compile");
+            startInfo.ArgumentList.Add("-consoleLoggerParameters:NoSummary;Verbosity=minimal");
             startInfo.ArgumentList.Add("-p:NuGetInteractive=true");
-            startInfo.ArgumentList.Add($"-p:NonExistentFile={forcedOutputPath}");
 
             using var process = Process.Start(startInfo);
             if (process == null)
             {
-                message = $"Failed to start MSBuild compile for '{projectInfo.ProjectPath}'.";
+                message = $"Failed to start dotnet build for '{projectInfo.ProjectPath}'.";
                 return false;
             }
 
@@ -532,7 +656,7 @@ internal sealed class FSharpHotReloadService
             var standardOutput = standardOutputTask.GetAwaiter().GetResult();
             var standardError = standardErrorTask.GetAwaiter().GetResult();
             var details = string.IsNullOrWhiteSpace(standardError) ? standardOutput : standardError;
-            message = $"MSBuild Compile target failed for '{projectInfo.ProjectPath}' (exit code {process.ExitCode}). {details.Trim()}";
+            message = $"dotnet build failed for '{projectInfo.ProjectPath}' (exit code {process.ExitCode}). {details.Trim()}";
             return false;
         }
         catch (Exception ex)
@@ -1084,6 +1208,19 @@ internal sealed class FSharpHotReloadService
                     ? ImmutableArray<int>.Empty
                     : updatedTypesEnumerable.Cast<object>().Select(Convert.ToInt32).ToImmutableArray();
 
+                var updatedMethodsEnumerable = deltaType.GetProperty("UpdatedMethods")?.GetValue(delta) as IEnumerable;
+                var updatedMethods = updatedMethodsEnumerable == null
+                    ? ImmutableArray<int>.Empty
+                    : updatedMethodsEnumerable.Cast<object>().Select(Convert.ToInt32).ToImmutableArray();
+
+                if (_trace)
+                {
+                    _logger.LogDebug(
+                        "F# managed delta token summary: UpdatedTypes=[{UpdatedTypes}], UpdatedMethods=[{UpdatedMethods}].",
+                        FormatTokenSet(updatedTypes),
+                        FormatTokenSet(updatedMethods));
+                }
+
                 return new HotReloadManagedCodeUpdate(
                     moduleId,
                     ImmutableArray.CreateRange(metadata),
@@ -1194,6 +1331,11 @@ internal sealed class FSharpHotReloadService
             var index = text.IndexOfAny(delimiters);
             return index > 0 ? text[..index] : text;
         }
+
+        private static string FormatTokenSet(ImmutableArray<int> tokens)
+            => tokens.IsDefaultOrEmpty
+                ? "<none>"
+                : string.Join(", ", tokens.Select(static token => $"0x{token:X8}"));
 
         private static object?[] CreateCheckerArguments(ParameterInfo[] parameters)
         {
