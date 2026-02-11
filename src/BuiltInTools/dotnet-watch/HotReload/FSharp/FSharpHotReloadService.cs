@@ -202,9 +202,24 @@ internal sealed class FSharpHotReloadService
         }
 
         var changedSourceFiles = GetChangedSourceFilesForProject(changedFiles, projectInfo.ProjectId);
+        var changedDependencyFiles = GetChangedDependencyFilesForProject(changedFiles, projectInfo);
+
+        if (_trace && !changedDependencyFiles.IsEmpty)
+        {
+            _logger.LogDebug(
+                "F# dependency changes considered for managed update in '{ProjectPath}': {ChangedFiles}",
+                projectInfo.ProjectPath,
+                string.Join(", ", changedDependencyFiles));
+        }
+
         foreach (var changedSourceFile in changedSourceFiles)
         {
             host.NotifyFileChanged(changedSourceFile, projectInfo, _activeProjectInput!, cancellationToken);
+        }
+
+        if (!changedDependencyFiles.IsEmpty)
+        {
+            host.InvalidateConfiguration(_activeProjectInput!, projectInfo.ProjectPath);
         }
 
         if (!host.TryRefreshProjectInput(projectInfo, _activeProjectInput!, out var refreshedProjectInput, out var refreshMessage))
@@ -310,6 +325,13 @@ internal sealed class FSharpHotReloadService
                             string.Join(", ", changedSourceFiles));
                     }
                 }
+                else if (!changedDependencyFiles.IsEmpty && _trace)
+                {
+                    _logger.LogDebug(
+                        "F# managed update produced no semantic delta for edited dependency files. Project='{ProjectPath}', Files='{ChangedFiles}'",
+                        projectInfo.ProjectPath,
+                        string.Join(", ", changedDependencyFiles));
+                }
 
                 // Roslyn parity: source edits with insignificant/no semantic changes stay in NoChangesToApply
                 // and should not force restart/rebuild of the running process.
@@ -377,42 +399,138 @@ internal sealed class FSharpHotReloadService
     {
         foreach (var file in changedFiles)
         {
-            if (!IsFSharpSourcePath(file.Item.FilePath))
+            var filePath = file.Item.FilePath;
+            var isSourceChange = IsFSharpSourcePath(filePath);
+            var isDependencyChange = IsManagedDependencyCandidatePath(filePath);
+
+            if (_trace)
+            {
+                _logger.LogDebug(
+                    "F# changed file candidate '{FilePath}': source={IsSourceChange}, dependency={IsDependencyChange}, containingProjects=[{ContainingProjects}].",
+                    filePath,
+                    isSourceChange,
+                    isDependencyChange,
+                    string.Join(", ", file.Item.ContainingProjectPaths));
+            }
+
+            if (!isSourceChange && !isDependencyChange)
             {
                 continue;
             }
 
-                foreach (var containingProjectPath in file.Item.ContainingProjectPaths)
-                {
-                    if (!runningProjects.ContainsKey(containingProjectPath))
-                    {
-                        continue;
-                }
-
-                foreach (var projectId in _projects.Keys)
-                {
-                    if (PathUtilities.OSSpecificPathComparer.Equals(projectId.ProjectPath, containingProjectPath))
-                    {
-                        return projectId;
-                    }
-                }
+            if (TryMatchRunningProjectByContainingPaths(file.Item.ContainingProjectPaths, runningProjects, out var containingProject))
+            {
+                return containingProject;
             }
 
-            if (TryMatchRunningProjectByPath(file.Item.FilePath, runningProjects, out var fallbackProject))
+            if (isDependencyChange &&
+                TryMatchRunningProjectByDependencyPath(filePath, runningProjects, out var dependencyProject))
             {
                 if (_trace)
                 {
                     _logger.LogDebug(
-                        "F# changed file '{FilePath}' matched project '{ProjectPath}' using path fallback.",
-                        file.Item.FilePath,
-                        fallbackProject.ProjectPath);
+                        "F# dependency change '{FilePath}' matched project '{ProjectPath}' via command-line dependency mapping.",
+                        filePath,
+                        dependencyProject.ProjectPath);
+                }
+
+                return dependencyProject;
+            }
+
+            if ((isSourceChange || isDependencyChange) &&
+                TryMatchRunningProjectByPath(filePath, runningProjects, out var fallbackProject))
+            {
+                if (_trace)
+                {
+                    _logger.LogDebug(
+                        "F# changed file '{FilePath}' matched project '{ProjectPath}' using path fallback ({ChangeKind}).",
+                        filePath,
+                        fallbackProject.ProjectPath,
+                        isSourceChange ? "source" : "dependency");
                 }
 
                 return fallbackProject;
             }
         }
 
+        if (_trace)
+        {
+            var candidateFiles = changedFiles
+                .Where(file =>
+                {
+                    var candidatePath = file.Item.FilePath;
+                    return IsFSharpSourcePath(candidatePath) || IsManagedDependencyCandidatePath(candidatePath);
+                })
+                .Select(file => file.Item.FilePath)
+                .ToImmutableArray();
+
+            if (!candidateFiles.IsEmpty)
+            {
+                _logger.LogDebug(
+                    "F# change matching failed. Candidates=[{ChangedFiles}] RunningProjects=[{RunningProjects}] KnownProjects=[{KnownProjects}].",
+                    string.Join(", ", candidateFiles),
+                    string.Join(", ", runningProjects.Keys.OrderBy(static key => key)),
+                    string.Join(", ", _projects.Keys.Select(static project => project.ProjectPath).OrderBy(static key => key)));
+            }
+        }
+
         return null;
+    }
+
+    private bool TryMatchRunningProjectByContainingPaths(
+        IReadOnlyList<string> containingProjectPaths,
+        ImmutableDictionary<string, ImmutableArray<RunningProject>> runningProjects,
+        out ProjectInstanceId projectId)
+    {
+        projectId = default;
+
+        foreach (var containingProjectPath in containingProjectPaths)
+        {
+            if (!runningProjects.ContainsKey(containingProjectPath))
+            {
+                continue;
+            }
+
+            foreach (var knownProject in _projects.Keys)
+            {
+                if (PathUtilities.OSSpecificPathComparer.Equals(knownProject.ProjectPath, containingProjectPath))
+                {
+                    projectId = knownProject;
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryMatchRunningProjectByDependencyPath(
+        string filePath,
+        ImmutableDictionary<string, ImmutableArray<RunningProject>> runningProjects,
+        out ProjectInstanceId projectId)
+    {
+        projectId = default;
+
+        if (!TryNormalizeFullPath(filePath, out var normalizedFilePath))
+        {
+            return false;
+        }
+
+        foreach (var projectInfo in _projects.Values)
+        {
+            if (!runningProjects.ContainsKey(projectInfo.ProjectPath))
+            {
+                continue;
+            }
+
+            if (IsCommandLineDependencyPath(normalizedFilePath, projectInfo))
+            {
+                projectId = projectInfo.ProjectId;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private bool TryMatchRunningProjectByPath(
@@ -447,6 +565,43 @@ internal sealed class FSharpHotReloadService
         }
 
         return false;
+    }
+
+    private ImmutableArray<string> GetChangedDependencyFilesForProject(
+        IReadOnlyList<ChangedFile> changedFiles,
+        FSharpProjectInfo projectInfo)
+    {
+        var changedDependencyFiles = new HashSet<string>(PathUtilities.OSSpecificPathComparer);
+
+        foreach (var changedFile in changedFiles)
+        {
+            var filePath = changedFile.Item.FilePath;
+            if (!IsManagedDependencyCandidatePath(filePath))
+            {
+                continue;
+            }
+
+            var isProjectMatchFromContainingPaths =
+                changedFile.Item.ContainingProjectPaths.Any(containingProjectPath =>
+                    PathUtilities.OSSpecificPathComparer.Equals(containingProjectPath, projectInfo.ProjectPath));
+            var isCommandLineDependency = IsCommandLineDependencyPath(filePath, projectInfo);
+            var isProjectDirectoryDependency = IsFileWithinProjectDirectory(filePath, projectInfo.ProjectPath);
+            if (!isProjectMatchFromContainingPaths && !isCommandLineDependency && !isProjectDirectoryDependency)
+            {
+                continue;
+            }
+
+            if (TryNormalizeFullPath(filePath, out var normalizedFilePath))
+            {
+                changedDependencyFiles.Add(normalizedFilePath);
+            }
+            else
+            {
+                changedDependencyFiles.Add(filePath);
+            }
+        }
+
+        return [.. changedDependencyFiles];
     }
 
     private ImmutableArray<string> GetChangedSourceFilesForProject(
@@ -596,6 +751,186 @@ internal sealed class FSharpHotReloadService
                string.Equals(extension, ".fsx", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsManagedDependencyCandidatePath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || IsFSharpSourcePath(path))
+        {
+            return false;
+        }
+
+        var fileName = Path.GetFileName(path);
+        if (fileName.Length == 0)
+        {
+            return false;
+        }
+
+        if (fileName.EndsWith("~", StringComparison.Ordinal) ||
+            fileName.StartsWith("~$", StringComparison.Ordinal) ||
+            (fileName.StartsWith("#", StringComparison.Ordinal) && fileName.EndsWith("#", StringComparison.Ordinal)))
+        {
+            return false;
+        }
+
+        var extension = Path.GetExtension(path);
+        if (string.IsNullOrEmpty(extension))
+        {
+            return false;
+        }
+
+        if (string.Equals(extension, ".fsproj", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(extension, ".props", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(extension, ".targets", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(extension, ".sln", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(extension, ".slnx", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(extension, ".proj", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (string.Equals(extension, ".swp", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(extension, ".swo", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(extension, ".swx", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(extension, ".tmp", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(extension, ".temp", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsCommandLineDependencyPath(string filePath, FSharpProjectInfo projectInfo)
+    {
+        if (!TryNormalizeFullPath(filePath, out var normalizedFilePath))
+        {
+            return false;
+        }
+
+        var projectDirectory = Path.GetDirectoryName(projectInfo.ProjectPath) ?? Directory.GetCurrentDirectory();
+        foreach (var commandLineArg in projectInfo.CommandLineArgs)
+        {
+            if (!TryGetCommandLineDependencyPath(commandLineArg, projectDirectory, out var dependencyPath))
+            {
+                continue;
+            }
+
+            if (PathUtilities.OSSpecificPathComparer.Equals(normalizedFilePath, dependencyPath))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryGetCommandLineDependencyPath(string commandLineArg, string projectDirectory, out string? dependencyPath)
+    {
+        dependencyPath = null;
+
+        if (string.IsNullOrWhiteSpace(commandLineArg))
+        {
+            return false;
+        }
+
+        var arg = commandLineArg.Trim().Trim('"');
+        if (arg.Length == 0)
+        {
+            return false;
+        }
+
+        if (arg.StartsWith("-r:", StringComparison.OrdinalIgnoreCase) ||
+            arg.StartsWith("--reference:", StringComparison.OrdinalIgnoreCase) ||
+            arg.StartsWith("-o:", StringComparison.OrdinalIgnoreCase) ||
+            arg.StartsWith("--out:", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (arg.StartsWith("-", StringComparison.Ordinal))
+        {
+            if (!TryExtractValueFromKnownPrefix(
+                    arg,
+                    ["--resource:", "-resource:", "--res:", "-res:", "--win32res:", "--keyfile:", "--load:", "--use:"],
+                    out var optionValue,
+                    out var matchedPrefix))
+            {
+                return false;
+            }
+
+            if (matchedPrefix is "--resource:" or "-resource:" or "--res:" or "-res:" or "--win32res:")
+            {
+                // F# resource switches can include metadata after commas, e.g. --resource:path,logicalName.
+                // We only need the physical file path for dependency invalidation matching.
+                var commaIndex = optionValue!.IndexOf(',');
+                if (commaIndex >= 0)
+                {
+                    optionValue = optionValue[..commaIndex];
+                }
+            }
+
+            return TryNormalizeDependencyPath(optionValue!, projectDirectory, out dependencyPath);
+        }
+
+        return TryNormalizeDependencyPath(arg, projectDirectory, out dependencyPath);
+    }
+
+    private static bool TryExtractValueFromKnownPrefix(
+        string value,
+        IReadOnlyList<string> prefixes,
+        out string? extractedValue,
+        out string? matchedPrefix)
+    {
+        foreach (var prefix in prefixes)
+        {
+            if (value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && value.Length > prefix.Length)
+            {
+                extractedValue = value[prefix.Length..];
+                matchedPrefix = prefix;
+                return true;
+            }
+        }
+
+        extractedValue = null;
+        matchedPrefix = null;
+        return false;
+    }
+
+    private static bool TryNormalizeDependencyPath(string path, string projectDirectory, out string? normalizedPath)
+    {
+        normalizedPath = null;
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        var candidatePath = path.Trim().Trim('"');
+        if (candidatePath.Length == 0)
+        {
+            return false;
+        }
+
+        if (!Path.IsPathRooted(candidatePath))
+        {
+            candidatePath = Path.Combine(projectDirectory, candidatePath);
+        }
+
+        return TryNormalizeFullPath(candidatePath, out normalizedPath);
+    }
+
+    private static bool TryNormalizeFullPath(string path, out string normalizedPath)
+    {
+        normalizedPath = path;
+        try
+        {
+            normalizedPath = Path.GetFullPath(path);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static bool IsTraceEnabled()
     {
         var value = Environment.GetEnvironmentVariable("DOTNET_WATCH_TRACE_FSHARP_HOTRELOAD");
@@ -672,6 +1007,7 @@ internal sealed class FSharpHotReloadService
         private readonly MethodInfo? _notifyFileChanged;
         private readonly MethodInfo _emitDelta;
         private readonly MethodInfo _endSession;
+        private readonly ImmutableArray<MethodInfo> _invalidateConfigurationMethods;
         private readonly MethodInfo _runSynchronously;
         private readonly bool _useWorkspaceSnapshots;
         private readonly object? _workspaceProjects;
@@ -691,6 +1027,7 @@ internal sealed class FSharpHotReloadService
             MethodInfo? notifyFileChanged,
             MethodInfo emitDelta,
             MethodInfo endSession,
+            ImmutableArray<MethodInfo> invalidateConfigurationMethods,
             MethodInfo runSynchronously,
             bool useWorkspaceSnapshots,
             object? workspaceProjects,
@@ -709,6 +1046,7 @@ internal sealed class FSharpHotReloadService
             _notifyFileChanged = notifyFileChanged;
             _emitDelta = emitDelta;
             _endSession = endSession;
+            _invalidateConfigurationMethods = invalidateConfigurationMethods;
             _runSynchronously = runSynchronously;
             _useWorkspaceSnapshots = useWorkspaceSnapshots;
             _workspaceProjects = workspaceProjects;
@@ -774,6 +1112,11 @@ internal sealed class FSharpHotReloadService
 
                 var endSession = checkerType.GetMethod("EndHotReloadSession", BindingFlags.Public | BindingFlags.Instance)
                     ?? throw new MissingMethodException(checkerType.FullName, "EndHotReloadSession");
+
+                var invalidateConfigurationMethods = checkerType
+                    .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .Where(method => method.Name == "InvalidateConfiguration" && method.GetParameters().Length >= 1)
+                    .ToImmutableArray();
 
                 var fsharpAsyncType = Type.GetType("Microsoft.FSharp.Control.FSharpAsync, FSharp.Core", throwOnError: true)!;
                 var runSynchronously = fsharpAsyncType.GetMethods(BindingFlags.Public | BindingFlags.Static)
@@ -859,6 +1202,7 @@ internal sealed class FSharpHotReloadService
                     notifyFileChanged,
                     selectedEmitDelta,
                     endSession,
+                    invalidateConfigurationMethods,
                     runSynchronously,
                     useWorkspaceSnapshots,
                     workspaceProjects,
@@ -1023,13 +1367,54 @@ internal sealed class FSharpHotReloadService
                 return TryCreateWorkspaceSnapshotInput(projectInfo, out refreshedProjectInput, out error);
             }
 
-            refreshedProjectInput = currentProjectInput;
-            error = null;
-            return true;
+            return TryCreateProjectOptionsInput(projectInfo, out refreshedProjectInput, out error);
         }
 
         public FSharpInvocationResult StartSession(object projectInput, CancellationToken cancellationToken)
             => InvokeResult(_startSession, [projectInput, null], cancellationToken);
+
+        public void InvalidateConfiguration(object projectInput, string projectPath)
+        {
+            if (_invalidateConfigurationMethods.IsDefaultOrEmpty)
+            {
+                return;
+            }
+
+            try
+            {
+                var projectInputType = projectInput.GetType();
+                var method = _invalidateConfigurationMethods.FirstOrDefault(candidate =>
+                {
+                    var parameters = candidate.GetParameters();
+                    return parameters.Length >= 1 && parameters[0].ParameterType.IsAssignableFrom(projectInputType);
+                });
+
+                if (method == null)
+                {
+                    return;
+                }
+
+                var parameterCount = method.GetParameters().Length;
+                var args = parameterCount switch
+                {
+                    1 => [projectInput],
+                    _ => new object?[] { projectInput, null },
+                };
+
+                _ = method.Invoke(_checker, args);
+            }
+            catch (Exception ex)
+            {
+                if (_trace)
+                {
+                    var rootException = (ex as TargetInvocationException)?.InnerException ?? ex.GetBaseException();
+                    _logger.LogDebug(
+                        "F# InvalidateConfiguration failed for '{ProjectPath}': {Message}",
+                        projectPath,
+                        rootException.Message);
+                }
+            }
+        }
 
         public void NotifyFileChanged(string filePath, FSharpProjectInfo projectInfo, object projectInput, CancellationToken cancellationToken)
         {

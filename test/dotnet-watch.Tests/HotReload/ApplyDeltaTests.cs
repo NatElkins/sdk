@@ -756,6 +756,68 @@ public class ApplyDeltaTests(ITestOutputHelper logger) : DotNetWatchTestBase(log
         }
 
         [Fact]
+        public async Task ChangeDependencyFileInFSharpProject_DoesNotRestart_AndSourceEditsStillApplyInPlace()
+        {
+            var testAsset = TestAssets.CopyTestAsset("FSharpTestAppSimple")
+                .WithSource()
+                .WithProjectChanges(project =>
+                {
+                    var ns = project.Root.Name.Namespace;
+                    project.Root.Add(
+                        new XElement(ns + "ItemGroup",
+                            new XElement(ns + "EmbeddedResource", new XAttribute("Include", "payload.txt")),
+                            new XElement(ns + "Watch", new XAttribute("Include", "payload.txt"))));
+                });
+
+            var sdkDirectory = TestContext.Current.ToolsetUnderTest.SdkFolderUnderTest;
+            var fsharpCompilerServicePath = Path.Combine(sdkDirectory, "FSharp", "FSharp.Compiler.Service.dll");
+            Assert.True(File.Exists(fsharpCompilerServicePath), $"Missing FSharp.Compiler.Service.dll at '{fsharpCompilerServicePath}'.");
+
+            App.EnvironmentVariables["DOTNET_WATCH_FSHARP_COMPILER_SERVICE_PATH"] = fsharpCompilerServicePath;
+            App.EnvironmentVariables["DOTNET_WATCH_FSHARP_USE_WORKSPACE_SNAPSHOTS"] = "1";
+            App.EnvironmentVariables["DOTNET_WATCH_TRACE_FSHARP_HOTRELOAD"] = "1";
+
+            var source = """
+            module ConsoleApplication.Program
+
+            open System
+            open System.Threading
+
+            let message () = "Waiting"
+
+            [<EntryPoint>]
+            let main argv =
+                while true do
+                    printfn "%s" (message())
+                    Thread.Sleep(200)
+                0
+            """;
+
+            var sourcePath = Path.Combine(testAsset.Path, "Program.fs");
+            var dependencyPath = Path.Combine(testAsset.Path, "payload.txt");
+
+            File.WriteAllText(sourcePath, source);
+            File.WriteAllText(dependencyPath, "payload-v1");
+
+            App.Start(testAsset, []);
+
+            await App.WaitForOutputLineContaining(MessageDescriptor.WaitingForChanges);
+            App.Process.ClearOutput();
+
+            UpdateSourceFile(dependencyPath, "payload-v2");
+
+            await WaitForFSharpManagedUpdateDecisionAsync();
+            App.AssertOutputDoesNotContain(MessageDescriptor.RestartNeededToApplyChanges.GetMessage());
+            App.Process.ClearOutput();
+
+            UpdateSourceFile(sourcePath, content => content.Replace("Waiting", "<UpdatedAfterDependencyEdit>"));
+
+            await App.WaitForOutputLineContaining(MessageDescriptor.HotReloadSucceeded);
+            AssertFSharpEditAppliedInPlace();
+            await App.AssertOutputLineStartsWith("<UpdatedAfterDependencyEdit>");
+        }
+
+        [Fact]
         public async Task ChangeFileInFSharpProject_RudeEditTriggersRestart()
         {
             var testAsset = TestAssets.CopyTestAsset("FSharpTestAppSimple")
