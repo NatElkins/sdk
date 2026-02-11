@@ -52,6 +52,14 @@ public class ApplyDeltaTests(ITestOutputHelper logger) : DotNetWatchTestBase(log
         return App.WaitForOutputLineContaining(new Regex($"{succeeded}|{restarted}"));
     }
 
+    private Task WaitForFSharpManagedUpdateDecisionAsync()
+    {
+        var noManagedChanges = Regex.Escape(MessageDescriptor.NoManagedCodeChangesToApply.GetMessage());
+        var succeeded = Regex.Escape(MessageDescriptor.HotReloadSucceeded.GetMessage());
+        var restarted = Regex.Escape(MessageDescriptor.RestartNeededToApplyChanges.GetMessage());
+        return App.WaitForOutputLineContaining(new Regex($"{noManagedChanges}|{succeeded}|{restarted}"));
+    }
+
         [Fact]
         public async Task AddSourceFile()
         {
@@ -694,6 +702,57 @@ public class ApplyDeltaTests(ITestOutputHelper logger) : DotNetWatchTestBase(log
 
             await App.WaitForOutputLineContaining(MessageDescriptor.HotReloadSucceeded);
             AssertFSharpEditAppliedInPlace();
+        }
+
+        [Fact]
+        public async Task ChangeFileInFSharpProject_WhitespaceOnlyEditDoesNotRestart()
+        {
+            var testAsset = TestAssets.CopyTestAsset("FSharpTestAppSimple")
+                .WithSource();
+
+            var sdkDirectory = TestContext.Current.ToolsetUnderTest.SdkFolderUnderTest;
+            var fsharpCompilerServicePath = Path.Combine(sdkDirectory, "FSharp", "FSharp.Compiler.Service.dll");
+            Assert.True(File.Exists(fsharpCompilerServicePath), $"Missing FSharp.Compiler.Service.dll at '{fsharpCompilerServicePath}'.");
+
+            App.EnvironmentVariables["DOTNET_WATCH_FSHARP_COMPILER_SERVICE_PATH"] = fsharpCompilerServicePath;
+            App.EnvironmentVariables["DOTNET_WATCH_FSHARP_USE_WORKSPACE_SNAPSHOTS"] = "1";
+
+            var source = """
+            module ConsoleApplication.Program
+
+            open System
+            open System.Threading
+
+            type Greeter() =
+                let mutable count = 0
+                member _.Message() =
+                    count <- count + 1
+                    sprintf "Waiting (count: %d)" count
+
+            let greeter = Greeter()
+
+            [<EntryPoint>]
+            let main argv =
+                while true do
+                    printfn "%s" (greeter.Message())
+                    Thread.Sleep(200)
+                0
+            """;
+
+            var sourcePath = Path.Combine(testAsset.Path, "Program.fs");
+            File.WriteAllText(sourcePath, source);
+
+            App.Start(testAsset, []);
+
+            await App.WaitForOutputLineContaining(MessageDescriptor.WaitingForChanges);
+            App.Process.ClearOutput();
+
+            // Roslyn parity: insignificant source edits should never force a restart.
+            // Depending on compiler output diff, this may classify as either no-op or in-place apply.
+            UpdateSourceFile(sourcePath, content => content.Replace("member _.Message() =", "member _.Message() =  "));
+
+            await WaitForFSharpManagedUpdateDecisionAsync();
+            App.AssertOutputDoesNotContain(MessageDescriptor.RestartNeededToApplyChanges.GetMessage());
         }
 
         [Fact]

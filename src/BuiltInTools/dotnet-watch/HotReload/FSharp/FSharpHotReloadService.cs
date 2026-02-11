@@ -309,14 +309,10 @@ internal sealed class FSharpHotReloadService
                             projectInfo.ProjectPath,
                             string.Join(", ", changedSourceFiles));
                     }
-
-                    return new FSharpManagedUpdateResult(
-                        FSharpManagedUpdateStatus.RestartRequired,
-                        [],
-                        projectInfo.ProjectPath,
-                        message);
                 }
 
+                // Roslyn parity: source edits with insignificant/no semantic changes stay in NoChangesToApply
+                // and should not force restart/rebuild of the running process.
                 return new FSharpManagedUpdateResult(FSharpManagedUpdateStatus.NoChanges, [], null, null);
             }
 
