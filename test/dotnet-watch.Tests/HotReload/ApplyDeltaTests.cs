@@ -818,6 +818,66 @@ public class ApplyDeltaTests(ITestOutputHelper logger) : DotNetWatchTestBase(log
         }
 
         [Fact]
+        public async Task ChangeXamlDependencyInFSharpProject_DoesNotRestart_AndSourceEditsStillApplyInPlace()
+        {
+            var testAsset = TestAssets.CopyTestAsset("FSharpTestAppSimple")
+                .WithSource()
+                .WithProjectChanges(project =>
+                {
+                    var ns = project.Root.Name.Namespace;
+                    project.Root.Add(
+                        new XElement(ns + "ItemGroup",
+                            new XElement(ns + "Watch", new XAttribute("Include", "MainPage.xaml"))));
+                });
+
+            var sdkDirectory = TestContext.Current.ToolsetUnderTest.SdkFolderUnderTest;
+            var fsharpCompilerServicePath = Path.Combine(sdkDirectory, "FSharp", "FSharp.Compiler.Service.dll");
+            Assert.True(File.Exists(fsharpCompilerServicePath), $"Missing FSharp.Compiler.Service.dll at '{fsharpCompilerServicePath}'.");
+
+            App.EnvironmentVariables["DOTNET_WATCH_FSHARP_COMPILER_SERVICE_PATH"] = fsharpCompilerServicePath;
+            App.EnvironmentVariables["DOTNET_WATCH_FSHARP_USE_WORKSPACE_SNAPSHOTS"] = "1";
+
+            var source = """
+            module ConsoleApplication.Program
+
+            open System
+            open System.Threading
+
+            let message () = "Waiting"
+
+            [<EntryPoint>]
+            let main argv =
+                while true do
+                    printfn "%s" (message())
+                    Thread.Sleep(200)
+                0
+            """;
+
+            var sourcePath = Path.Combine(testAsset.Path, "Program.fs");
+            var xamlPath = Path.Combine(testAsset.Path, "MainPage.xaml");
+
+            File.WriteAllText(sourcePath, source);
+            File.WriteAllText(xamlPath, "<Page><TextBlock Text=\"v1\" /></Page>");
+
+            App.Start(testAsset, []);
+
+            await App.WaitForOutputLineContaining(MessageDescriptor.WaitingForChanges);
+            App.Process.ClearOutput();
+
+            UpdateSourceFile(xamlPath, "<Page><TextBlock Text=\"v2\" /></Page>");
+
+            await WaitForFSharpManagedUpdateDecisionAsync();
+            App.AssertOutputDoesNotContain(MessageDescriptor.RestartNeededToApplyChanges.GetMessage());
+            App.Process.ClearOutput();
+
+            UpdateSourceFile(sourcePath, content => content.Replace("Waiting", "<UpdatedAfterXamlEdit>"));
+
+            await App.WaitForOutputLineContaining(MessageDescriptor.HotReloadSucceeded);
+            AssertFSharpEditAppliedInPlace();
+            await App.AssertOutputLineStartsWith("<UpdatedAfterXamlEdit>");
+        }
+
+        [Fact]
         public async Task ChangeFileInFSharpProject_RudeEditTriggersRestart()
         {
             var testAsset = TestAssets.CopyTestAsset("FSharpTestAppSimple")
