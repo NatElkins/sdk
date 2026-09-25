@@ -148,11 +148,15 @@ public class FSharpHotReloadTests : DotNetWatchTestBase
 
         open System
         open System.Threading
+        open System.Runtime.CompilerServices
+
+        [<MethodImpl(MethodImplOptions.NoInlining)>]
+        let message () = "Waiting"
 
         [<EntryPoint>]
         let main argv =
             while true do
-                printfn "Waiting"
+                printfn "%s" (message ())
                 Thread.Sleep(200)
             0
         """;
@@ -170,8 +174,8 @@ public class FSharpHotReloadTests : DotNetWatchTestBase
         await App.WaitUntilOutputContains(MessageDescriptor.ManagedCodeChangesApplied);
         AssertFSharpEditAppliedInPlace();
 
-        // The apply log alone does not prove the delta took effect: assert the running loop
-        // now prints the edited string in place (it printed "Waiting" before the edit).
+        // The apply log alone does not prove the delta took effect. Keep the edited helper out
+        // of the permanently active loop frame, then assert later calls observe its new body.
         await App.AssertOutputLineStartsWith("<UpdatedInPlace>");
     }
 
@@ -459,10 +463,21 @@ public class FSharpHotReloadTests : DotNetWatchTestBase
             .Replace("let core () = \"LibWaiting\"", "let coreRenamed () = \"LibAfterRestart\"")
             .Replace("core ()", "coreRenamed ()"));
 
-        await App.WaitUntilOutputContains(MessageDescriptor.RestartNeededToApplyChanges);
-        await App.WaitUntilOutputContains(MessageDescriptor.Exited, projectDisplay);
-        await App.WaitUntilOutputContains(MessageDescriptor.LaunchedProcess, projectDisplay);
-        await App.WaitUntilOutputContains(MessageDescriptor.WaitingForChanges);
+        // Bound every expected restart transition so a missing ancestor restart fails this work
+        // item directly instead of occupying a Helix machine until its outer timeout expires.
+        var restartTimeout = TimeSpan.FromMinutes(2);
+        await App.WaitUntilOutputContains(MessageDescriptor.RestartNeededToApplyChanges)
+            .AsTask()
+            .WaitAsync(restartTimeout, TestContext.CancellationToken);
+        await App.WaitUntilOutputContains(MessageDescriptor.Exited, projectDisplay)
+            .AsTask()
+            .WaitAsync(restartTimeout, TestContext.CancellationToken);
+        await App.WaitUntilOutputContains(MessageDescriptor.LaunchedProcess, projectDisplay)
+            .AsTask()
+            .WaitAsync(restartTimeout, TestContext.CancellationToken);
+        await App.WaitUntilOutputContains(MessageDescriptor.WaitingForChanges)
+            .AsTask()
+            .WaitAsync(restartTimeout, TestContext.CancellationToken);
     }
 
     [TestMethod]
