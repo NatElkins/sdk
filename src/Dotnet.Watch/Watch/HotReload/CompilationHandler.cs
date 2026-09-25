@@ -389,6 +389,12 @@ internal sealed class CompilationHandler : IDisposable
 
         if (updates.Status == HotReloadService.Status.Blocked || fsharpResult.Status == FSharpManagedUpdateStatus.Blocked)
         {
+            if (fsharpResult.Status == FSharpManagedUpdateStatus.Blocked && !string.IsNullOrEmpty(fsharpResult.Message))
+            {
+                // The external F# compile captures its output, so the host must display the failure.
+                Logger.LogError("{Message}", fsharpResult.Message);
+            }
+
             // If Hot Reload is blocked (due to compilation error) we ignore the current
             // changes and await the next file change.
 

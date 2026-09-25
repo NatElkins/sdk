@@ -22,7 +22,7 @@ internal sealed class Program(
     EnvironmentOptions environmentOptions)
 {
     public const string LogComponentName = nameof(Program);
-    private const string LogMessagePrefix = "dotnet watch";
+    private const string LogMessagePrefix = "fsharp-watch";
 
     public static async Task<int> Main(string[] args)
     {
@@ -373,7 +373,10 @@ internal sealed class Program(
 
     private static void RegisterAssemblyResolutionEvents(string sdkRootDirectory)
     {
-        var roslynPath = Path.Combine(sdkRootDirectory, "Roslyn", "bincore");
+        // The tool carries Roslyn assemblies that match its workspace and hot reload components.
+        var roslynPath = File.Exists(Path.Combine(AppContext.BaseDirectory, "Microsoft.CodeAnalysis.dll"))
+            ? AppContext.BaseDirectory
+            : Path.Combine(sdkRootDirectory, "Roslyn", "bincore");
 
         AssemblyLoadContext.Default.Resolving += (context, assembly) =>
         {
