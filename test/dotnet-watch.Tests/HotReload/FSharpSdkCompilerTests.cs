@@ -71,7 +71,7 @@ public class FSharpSdkCompilerTests
             var compilerCore = context.LoadFromAssemblyName(new AssemblyName("FSharp.Core"));
             Assert.AreNotSame(defaultCore, compilerCore);
             Assert.AreSame(context, AssemblyLoadContext.GetLoadContext(compilerCore));
-            Assert.AreEqual(Path.Combine(compilerDirectory, "FSharp.Core.dll"), compilerCore.Location);
+            Assert.AreEqual(Path.GetFullPath(Path.Combine(compilerDirectory, "FSharp.Core.dll")), compilerCore.Location);
         }
         finally
         {
