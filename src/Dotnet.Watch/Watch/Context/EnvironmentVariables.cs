@@ -45,6 +45,8 @@ internal static class EnvironmentVariables
     public static TimeSpan? ProcessCleanupTimeout => ReadTimeSpanMilliseconds("DOTNET_WATCH_PROCESS_CLEANUP_TIMEOUT_MS");
 
     public static string SdkRootDirectory =>
+        // The global tool uses the selected SDK for MSBuild without an SDK-local installation.
+        Environment.GetEnvironmentVariable("FSHARP_WATCH_SDK_DIRECTORY") ??
 #if DEBUG
         Environment.GetEnvironmentVariable("DOTNET_WATCH_DEBUG_SDK_DIRECTORY") ?? "";
 #else

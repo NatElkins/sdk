@@ -197,7 +197,7 @@ internal abstract class MessageDescriptor(string? format, Emoji emoji, LogLevel 
     public static readonly MessageDescriptor<None> FixBuildError = Create("Fix the error to continue or press Ctrl+C to exit.", Emoji.Watch, LogLevel.Warning);
     public static readonly MessageDescriptor<None> WaitingForChanges = Create("Waiting for changes", Emoji.Watch, LogLevel.Information);
     public static readonly MessageDescriptor<(string, string, int)> LaunchedProcess = Create<(string, string, int)>("Launched '{0}' with arguments '{1}': process id {2}", Emoji.Launch, LogLevel.Debug);
-    public static readonly MessageDescriptor<long> ManagedCodeChangesApplied = Create<long>("C# and Razor changes applied in {0}ms.", Emoji.HotReload, LogLevel.Information);
+    public static readonly MessageDescriptor<long> ManagedCodeChangesApplied = Create<long>("Managed code changes applied in {0}ms.", Emoji.HotReload, LogLevel.Information);
     public static readonly MessageDescriptor<long> StaticAssetsChangesApplied = Create<long>("Static asset changes applied in {0}ms.", Emoji.HotReload, LogLevel.Information);
     public static readonly MessageDescriptor<None> StaticWebAssetManifestNotFound = Create("Static web asset manifest not found.", Emoji.Warning, LogLevel.Warning);
     public static readonly MessageDescriptor<string> ScopedCssBundleFileNotFound = Create<string>("Scoped CSS bundle file '{0}' not found.", Emoji.Warning, LogLevel.Warning);

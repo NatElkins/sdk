@@ -33,7 +33,14 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Build.Locator" />
     <PackageReference Include="Microsoft.Build" ExcludeAssets="runtime" PrivateAssets="All" />
+    <PackageReference Include="Microsoft.Build.Framework" ExcludeAssets="runtime" PrivateAssets="All" />
     <PackageReference Include="Spectre.Console" />
+  </ItemGroup>
+
+  <!-- MSBuild's compile references require these versions when the standalone host targets .NET 10. -->
+  <ItemGroup Condition="'$(SdkTargetFramework)' == 'net10.0'">
+    <PackageReference Include="System.Collections.Immutable" VersionOverride="$(MicrosoftNETCoreAppRefPackageVersion)" />
+    <PackageReference Include="System.Reflection.Metadata" VersionOverride="$(MicrosoftNETCoreAppRefPackageVersion)" />
   </ItemGroup>
 
   <ItemGroup>

@@ -22,13 +22,28 @@ internal sealed class Program(
     EnvironmentOptions environmentOptions)
 {
     public const string LogComponentName = nameof(Program);
-    private const string LogMessagePrefix = "dotnet watch";
+    private const string LogMessagePrefix = "fsharp-watch";
 
     public static async Task<int> Main(string[] args)
     {
         try
         {
+            if (args is ["--fsharp-watch-probe", var compilerPath])
+            {
+                var probe = FSharpHotReloadService.ProbeCompiler(compilerPath, Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
+                Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(probe, new System.Text.Json.JsonSerializerOptions { PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase }));
+                return 0;
+            }
+
             var sdkRootDirectory = EnvironmentVariables.SdkRootDirectory;
+
+            if (Environment.GetEnvironmentVariable("FSHARP_WATCH_SDK_DIRECTORY") != null)
+            {
+                // SDK tasks can require newer NuGet assemblies than this independently versioned tool.
+                // Keep their dependencies in MSBuild's task context before its loader reads these switches.
+                Environment.SetEnvironmentVariable("MSBUILDUSECUSTOMLOADCONTEXTFORDEPENDENCIESINTOOLSDIRECTORY", "1");
+                Environment.SetEnvironmentVariable("MSBUILDSINGLELOADCONTEXT", "0");
+            }
 
             // We can register the MSBuild that is bundled with the SDK to perform MSBuild things.
             // In production deployment dotnet-watch is in a nested folder of the SDK's root, we'll back up to it.
@@ -295,6 +310,11 @@ internal sealed class Program(
             // Ctrl+C forced an exit
             return 0;
         }
+        catch (FSharpCompilerChangedException) when (!shutdownHandler.CancellationToken.IsCancellationRequested)
+        {
+            logger.LogInformation("SDK or compiler identity changed. Ending the current watch session.");
+            return 75;
+        }
         catch (Exception e)
         {
             logger.LogError("An unexpected error occurred: {Exception}", e.ToString());
@@ -373,7 +393,10 @@ internal sealed class Program(
 
     private static void RegisterAssemblyResolutionEvents(string sdkRootDirectory)
     {
-        var roslynPath = Path.Combine(sdkRootDirectory, "Roslyn", "bincore");
+        // The tool carries Roslyn assemblies that match its workspace and hot reload components.
+        var roslynPath = File.Exists(Path.Combine(AppContext.BaseDirectory, "Microsoft.CodeAnalysis.dll"))
+            ? AppContext.BaseDirectory
+            : Path.Combine(sdkRootDirectory, "Roslyn", "bincore");
 
         AssemblyLoadContext.Default.Resolving += (context, assembly) =>
         {

@@ -24,6 +24,7 @@ internal sealed class HotReloadDotNetWatcher
 
     private readonly DotNetWatchContext _context;
     private readonly ProjectGraphFactory _designTimeBuildGraphFactory;
+    private readonly FSharpSdkPreparation? _fsharpPreparation;
 
     internal Task? Test_FileChangesCompletedTask { get; set; }
 
@@ -50,6 +51,11 @@ internal sealed class HotReloadDotNetWatcher
             _rudeEditRestartPrompt = new RestartPrompt(context.Logger, consoleInput, noPrompt ? true : null);
         }
 
+        if (Environment.GetEnvironmentVariable("FSHARP_WATCH_SDK_DIRECTORY") != null)
+        {
+            _fsharpPreparation = new FSharpSdkPreparation(context);
+        }
+
         _designTimeBuildGraphFactory = new ProjectGraphFactory(
             context.RootProjects,
             buildProperties: EvaluationResult.GetGlobalBuildProperties(
@@ -62,6 +68,7 @@ internal sealed class HotReloadDotNetWatcher
 
     public async Task WatchAsync(CancellationToken shutdownCancellationToken)
     {
+        using var compilerPreparation = _fsharpPreparation;
         CancellationTokenSource? forceRestartCancellationSource = null;
 
         _context.Logger.Log(MessageDescriptor.HotReloadEnabled);
@@ -78,6 +85,11 @@ internal sealed class HotReloadDotNetWatcher
         };
 
         using var fileWatcher = new FileWatcher(_context.Logger, _context.EnvironmentOptions);
+        if (_fsharpPreparation != null)
+        {
+            // Ancestor SDK selection files need exact, nonrecursive subscriptions, including absent files.
+            fileWatcher.WatchFiles(_fsharpPreparation.SelectionInputs);
+        }
 
         for (var iteration = 0; !shutdownCancellationToken.IsCancellationRequested; iteration++)
         {
@@ -142,6 +154,7 @@ internal sealed class HotReloadDotNetWatcher
                 // Session must be started before we start accepting file changes to avoid race condition
                 // when the EnC session hydrates solution documents with their file content after the changes have already been observed.
                 await compilationHandler.StartSessionAsync(evaluationResult.ProjectGraph.Graph, iterationCancellationToken);
+                _fsharpPreparation?.VerifyUnchanged();
 
                 var projectLauncher = new ProjectLauncher(_context, projectGraph, compilationHandler, iteration);
 
@@ -220,6 +233,7 @@ internal sealed class HotReloadDotNetWatcher
 
                 fileChangedCallback = FileChangedCallback;
                 fileWatcher.OnFileChange += fileChangedCallback;
+                _fsharpPreparation?.VerifyUnchanged();
                 _context.Logger.Log(MessageDescriptor.WaitingForChanges);
 
                 if (Test_FileChangesCompletedTask != null)
@@ -247,6 +261,13 @@ internal sealed class HotReloadDotNetWatcher
                         changedFiles = await CaptureChangedFilesSnapshot(rebuiltProjects: []);
                     }
                     while (changedFiles is []);
+
+                    _fsharpPreparation?.Prepare(evaluationResult.ProjectGraph.Graph);
+                    if (_fsharpPreparation is { HasFSharpProjects: true, IsSupported: false } preparation &&
+                        !await preparation.PreflightAsync(evaluationResult.Files.Keys.Concat(evaluationResult.ProjectGraph.BuildFiles), () => !changedFilesAccumulator.IsEmpty, iterationCancellationToken))
+                    {
+                        continue;
+                    }
 
                     var updates = new HotReloadProjectUpdatesBuilder();
                     var stopwatch = Stopwatch.StartNew();
@@ -317,6 +338,7 @@ internal sealed class HotReloadDotNetWatcher
 
                     // Apply updates only after dependencies have been deployed,
                     // so that updated code doesn't attempt to access the dependency before it has been deployed.
+                    _fsharpPreparation?.VerifyUnchanged();
                     await compilationHandler.ApplyManagedCodeAndStaticAssetUpdatesAndRelaunchAsync(updates.ManagedCodeUpdates, updates.StaticAssetsToUpdate, changedFiles, evaluationResult.ProjectGraph, stopwatch, iterationCancellationToken);
                     if (updates.ProjectsToRestart is not [])
                     {
@@ -330,6 +352,9 @@ internal sealed class HotReloadDotNetWatcher
                         {
                             return [];
                         }
+
+                        // Select a fresh SDK before project evaluation can use the old MSBuild context.
+                        _fsharpPreparation?.VerifyUnchanged();
 
                         // Note:
                         // It is possible that we could have received multiple changes for a file that should cancel each other (such as Delete + Add),
@@ -749,7 +774,8 @@ internal sealed class HotReloadDotNetWatcher
         if (evaluationResult != null)
         {
             _ = await fileWatcher.WaitForFileChangeAsync(
-                evaluationResult.Files,
+                change => evaluationResult.Files.ContainsKey(change.Path) ||
+                    _fsharpPreparation?.SelectionInputs.Contains(change.Path, PathUtilities.OSSpecificPathComparer) == true,
                 startedWatching: () => _context.Logger.Log(messageDescriptor),
                 cancellationToken);
         }
@@ -775,7 +801,8 @@ internal sealed class HotReloadDotNetWatcher
         // Handle changes to files that are known to be project build inputs from its evaluation.
         // Compile items might be explicitly added by targets to directories that are excluded by default
         // (e.g. global usings in obj directory). Changes to these files should not be ignored.
-        if (evaluationResult.Files.ContainsKey(path))
+        if (evaluationResult.Files.ContainsKey(path) ||
+            _fsharpPreparation?.SelectionInputs.Contains(path, PathUtilities.OSSpecificPathComparer) == true)
         {
             return true;
         }
@@ -806,6 +833,11 @@ internal sealed class HotReloadDotNetWatcher
     private bool AcceptChange(ChangedPath change)
     {
         var (path, kind) = change;
+
+        if (_fsharpPreparation?.SelectionInputs.Contains(path, PathUtilities.OSSpecificPathComparer) == true)
+        {
+            return true;
+        }
 
         if (Path.GetExtension(path) == ".binlog")
         {
@@ -913,7 +945,7 @@ internal sealed class HotReloadDotNetWatcher
         }
 
         string GetMessage(IReadOnlyList<ChangedFile> items, ChangeKind kind)
-            => items is [{Item: var item }]
+            => items is [{ Item: var item }]
                 ? GetSingularMessage(kind) + ": " + GetRelativeFilePath(item.FilePath)
                 : GetPluralMessage(kind) + ": " + string.Join(", ", items.Select(f => GetRelativeFilePath(f.Item.FilePath)));
 
@@ -1238,6 +1270,26 @@ internal sealed class HotReloadDotNetWatcher
 
     private async Task<bool> BuildFileOrProjectOrSolutionAsync(string path, string? targetFramework, DeviceInfo? device, BuildAction action, CancellationToken cancellationToken)
     {
+        if (_fsharpPreparation != null && action != BuildAction.RestoreOnly)
+        {
+            _fsharpPreparation.VerifyUnchanged();
+            if (action == BuildAction.RestoreAndBuild)
+            {
+                if (!await BuildFileOrProjectOrSolutionAsync(path, targetFramework, device, BuildAction.RestoreOnly, cancellationToken))
+                {
+                    return false;
+                }
+
+                action = BuildAction.BuildOnly;
+            }
+
+            var discovery = TryLoadProjectGraph(targetFramework, cancellationToken);
+            if (discovery != null)
+            {
+                _fsharpPreparation.Prepare(discovery.Graph);
+            }
+        }
+
         var arguments = new List<string>
         {
             action is BuildAction.RestoreOnly ? "restore" : "build",
@@ -1292,7 +1344,7 @@ internal sealed class HotReloadDotNetWatcher
                         capturedOutput.Add(line);
                     }
                 }
-                : null,
+            : null,
 
             // pass user-specified build arguments last to override defaults:
             Arguments = arguments

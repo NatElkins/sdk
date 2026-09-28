@@ -74,7 +74,7 @@ internal sealed class CompilationHandler : IDisposable
     public void Dispose()
     {
         _isDisposed = true;
-        _fsharpHotReloadService.EndSession();
+        _fsharpHotReloadService.Dispose();
         Workspace?.Dispose();
     }
 
@@ -393,6 +393,18 @@ internal sealed class CompilationHandler : IDisposable
 
         if (updates.Status == HotReloadService.Status.Blocked || fsharpResult.Status == FSharpManagedUpdateStatus.Blocked)
         {
+            if (fsharpResult.Status == FSharpManagedUpdateStatus.Blocked)
+            {
+                // The external F# compile captures its output, so the host must display the failure.
+                foreach (var issue in fsharpResult.Issues)
+                {
+                    if (!string.IsNullOrEmpty(issue.Message))
+                    {
+                        Logger.LogError("{Message}", issue.Message);
+                    }
+                }
+            }
+
             // If Hot Reload is blocked (due to compilation error) we ignore the current
             // changes and await the next file change.
 

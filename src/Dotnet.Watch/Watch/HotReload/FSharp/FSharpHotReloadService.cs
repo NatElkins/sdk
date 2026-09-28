@@ -32,7 +32,7 @@ internal readonly record struct FSharpManagedUpdateResult(
     ImmutableArray<FSharpManagedUpdate> Updates,
     ImmutableArray<FSharpManagedUpdateIssue> Issues);
 
-internal sealed class FSharpHotReloadService
+internal sealed class FSharpHotReloadService : IDisposable
 {
     private const string RudeEditHelpLink = "https://github.com/dotnet/fsharp/blob/main/docs/hot-reload-rude-edits.md";
 
@@ -61,6 +61,7 @@ internal sealed class FSharpHotReloadService
     private ImmutableDictionary<ProjectInstanceId, object> _cachedProjectInputs = ImmutableDictionary<ProjectInstanceId, object>.Empty;
     private ImmutableDictionary<ProjectInstanceId, Guid> _runtimeModuleIds = ImmutableDictionary<ProjectInstanceId, Guid>.Empty;
     private FSharpReflectionHost? _host;
+    private FSharpCompilerIdentity? _compilerIdentity;
 
     /// <summary>
     /// The active project for the LEGACY single-active-project checker surface (older compiler
@@ -97,8 +98,50 @@ internal sealed class FSharpHotReloadService
     {
         _logger = logger;
         _trace = IsTraceEnabled();
-        _disabled = IsDisabled();
+        _disabled = IsDisabled() || Environment.GetEnvironmentVariable(FSharpSdkPreparation.SupportedVariable) == "false";
         _getCapabilities = getCapabilities;
+    }
+
+    /// <summary>Probes the evaluated SDK compiler before the watcher grants experimental build flags.</summary>
+    internal static FSharpCompilerProbe ProbeCompiler(string compilerPath, ILogger logger)
+    {
+        try
+        {
+            var identity = FSharpCompilerIdentity.Read(compilerPath);
+            var project = new FSharpProjectInfo(default, "", "", "", identity.CompilerPath, []);
+            if (!FSharpReflectionHost.TryCreate(project, logger, trace: false, out var host, out var reason))
+            {
+                return new(false, reason, identity.CompilerPath, identity);
+            }
+
+            using (host)
+            {
+                if (!host.SupportsSessionObject || !host.TryCreateSession([], out var session, out reason))
+                {
+                    return new(false, reason ?? "The compiler does not expose the F# hot reload session API.", identity.CompilerPath, identity);
+                }
+
+                try
+                {
+                    if (!host.TrySessionUpdateCapabilities(session!, []))
+                    {
+                        throw new InvalidOperationException("The compiler rejected session capabilities.");
+                    }
+                    host.VerifyEmptySession(session!);
+                }
+                finally
+                {
+                    host.DisposeSession(session!);
+                }
+            }
+
+            identity.VerifyUnchanged();
+            return new(true, null, identity.CompilerPath, identity);
+        }
+        catch (Exception exception)
+        {
+            return new(false, exception.GetBaseException().Message, compilerPath, null);
+        }
     }
 
     /// <summary>True when the F# bridge owns F# source updates instead of the stock restart path.</summary>
@@ -252,6 +295,15 @@ internal sealed class FSharpHotReloadService
         return ValueTask.CompletedTask;
     }
 
+    /// <summary>Ends the session and releases compiler contexts and cached project inputs.</summary>
+    public void Dispose()
+    {
+        EndSession();
+        _host?.Dispose();
+        _host = null;
+        _cachedProjectInputs = ImmutableDictionary<ProjectInstanceId, object>.Empty;
+    }
+
     public void EndSession()
     {
         if (_disabled)
@@ -332,6 +384,7 @@ internal sealed class FSharpHotReloadService
     /// </summary>
     public void CommitUpdates()
     {
+        _compilerIdentity?.VerifyUnchanged();
         if (_disabled)
         {
             return;
@@ -406,7 +459,7 @@ internal sealed class FSharpHotReloadService
                 projectInfo,
                 changedFiles,
                 cancellationToken,
-                allowSessionReset: updates.Count == 0);
+                allowSessionReset: updates.Count == 0 && Environment.GetEnvironmentVariable(FSharpSdkPreparation.GrantsVariable) == null);
 
             if (projectResult.Status == FSharpManagedUpdateStatus.Blocked)
             {
@@ -427,6 +480,8 @@ internal sealed class FSharpHotReloadService
                     ? FSharpManagedUpdateStatus.ReadyToApply
                     : FSharpManagedUpdateStatus.NoChanges;
 
+        // Never hand off a delta if compiler files changed during compilation or emission.
+        _compilerIdentity?.VerifyUnchanged();
         return new FSharpManagedUpdateResult(status, updates.ToImmutable(), issues.ToImmutable());
     }
 
@@ -1083,12 +1138,21 @@ internal sealed class FSharpHotReloadService
 
         if (_host != null)
         {
+            _compilerIdentity!.VerifyUnchanged();
+            if (!PathUtilities.OSSpecificPathComparer.Equals(_compilerIdentity.CompilerPath, Path.GetFullPath(projectInfo.DotnetFscCompilerPath)))
+            {
+                throw new FSharpCompilerChangedException();
+            }
+
             host = _host;
             return true;
         }
 
+        var identity = File.Exists(projectInfo.DotnetFscCompilerPath) ? FSharpCompilerIdentity.Read(projectInfo.DotnetFscCompilerPath) : null;
         if (FSharpReflectionHost.TryCreate(projectInfo, _logger, _trace, out var createdHost, out message))
         {
+            identity!.VerifyUnchanged();
+            _compilerIdentity = identity;
             _host = createdHost;
             host = createdHost;
             return true;
@@ -1319,7 +1383,7 @@ internal sealed class FSharpHotReloadService
     /// DOTNET_WATCH_FSHARP_HOTRELOAD=0 (or false) disables the F# hot reload bridge entirely;
     /// any other value, including unset, leaves it enabled. See <see cref="_disabled"/>.
     /// </summary>
-    private static bool IsDisabled()
+    internal static bool IsDisabled()
     {
         var value = Environment.GetEnvironmentVariable("DOTNET_WATCH_FSHARP_HOTRELOAD");
         return string.Equals(value, "0", StringComparison.OrdinalIgnoreCase) ||
@@ -1422,11 +1486,12 @@ internal sealed class FSharpHotReloadService
         }
     }
 
-    private sealed class FSharpReflectionHost
+    private sealed class FSharpReflectionHost : IDisposable
     {
         private readonly ILogger _logger;
         private readonly bool _trace;
         private readonly object _checker;
+        private readonly FSharpCompilerLoadContext _loadContext;
         private readonly MethodInfo _getProjectOptions;
 
         // The legacy process-wide checker surface (StartHotReloadSession/EmitHotReloadDelta/
@@ -1482,8 +1547,10 @@ internal sealed class FSharpHotReloadService
             MethodInfo? workspaceProjectAddOrUpdate,
             MethodInfo? workspaceQueryGetProjectSnapshot,
             MethodInfo? workspaceFilesEdit,
-            MethodInfo? workspaceFilesClose)
+            MethodInfo? workspaceFilesClose,
+            FSharpCompilerLoadContext loadContext)
         {
+            _loadContext = loadContext;
             _logger = logger;
             _trace = trace;
             _checker = checker;
@@ -1515,13 +1582,8 @@ internal sealed class FSharpHotReloadService
             host = null!;
             error = null;
 
-            var servicePathOverride = Environment.GetEnvironmentVariable("DOTNET_WATCH_FSHARP_COMPILER_SERVICE_PATH");
-            var servicePath = servicePathOverride;
-            if (string.IsNullOrEmpty(servicePath))
-            {
-                var compilerDirectory = Path.GetDirectoryName(projectInfo.DotnetFscCompilerPath);
-                servicePath = compilerDirectory == null ? null : Path.Combine(compilerDirectory, "FSharp.Compiler.Service.dll");
-            }
+            var compilerDirectory = Path.GetDirectoryName(Path.GetFullPath(projectInfo.DotnetFscCompilerPath));
+            var servicePath = Path.Combine(compilerDirectory!, "FSharp.Compiler.Service.dll");
 
             if (string.IsNullOrEmpty(servicePath) || !File.Exists(servicePath))
             {
@@ -1529,9 +1591,11 @@ internal sealed class FSharpHotReloadService
                 return false;
             }
 
+            FSharpCompilerLoadContext? loadContext = null;
             try
             {
-                var assembly = Assembly.LoadFrom(servicePath);
+                loadContext = new FSharpCompilerLoadContext(projectInfo.DotnetFscCompilerPath);
+                var assembly = loadContext.LoadFromAssemblyPath(servicePath);
                 var checkerType = assembly.GetType("FSharp.Compiler.CodeAnalysis.FSharpChecker", throwOnError: true)!;
 
                 var createMethod = checkerType.GetMethod("Create", BindingFlags.Public | BindingFlags.Static)
@@ -1567,7 +1631,8 @@ internal sealed class FSharpHotReloadService
                     .Where(method => method.Name == "InvalidateConfiguration" && method.GetParameters().Length >= 1)
                     .ToImmutableArray();
 
-                var fsharpAsyncType = Type.GetType("Microsoft.FSharp.Control.FSharpAsync, FSharp.Core", throwOnError: true)!;
+                var core = loadContext.LoadFromAssemblyName(new AssemblyName("FSharp.Core"));
+                var fsharpAsyncType = core.GetType("Microsoft.FSharp.Control.FSharpAsync", throwOnError: true)!;
                 var runSynchronously = fsharpAsyncType.GetMethods(BindingFlags.Public | BindingFlags.Static)
                     .First(method => method.Name == "RunSynchronously" && method.IsGenericMethod && method.GetParameters().Length == 3);
 
@@ -1597,7 +1662,7 @@ internal sealed class FSharpHotReloadService
                 string? workspaceError = null;
                 MethodInfo? selectedStartSession;
                 MethodInfo? selectedEmitDelta;
-                var preferWorkspaceSnapshots = ShouldPreferWorkspaceSnapshots(servicePathOverride);
+                var preferWorkspaceSnapshots = ShouldPreferWorkspaceSnapshots(servicePath);
 
                 // The session-object API (FSharpChecker.CreateHotReloadSession) supersedes the
                 // process-wide single-session checker surface. It consumes project snapshots, so
@@ -1697,15 +1762,20 @@ internal sealed class FSharpHotReloadService
                     workspaceProjectAddOrUpdate,
                     workspaceQueryGetProjectSnapshot,
                     workspaceFilesEdit,
-                    workspaceFilesClose);
+                    workspaceFilesClose,
+                    loadContext);
                 return true;
             }
             catch (Exception ex)
             {
-                error = ex.Message;
+                loadContext?.Unload();
+                error = ex.GetBaseException().Message;
                 return false;
             }
         }
+
+        /// <summary>Releases the isolated compiler load context.</summary>
+        public void Dispose() => _loadContext.Unload();
 
         private static bool ShouldUseSessionObject()
         {
@@ -1790,7 +1860,8 @@ internal sealed class FSharpHotReloadService
                     var parameters = method.GetParameters();
                     return parameters.Length == 3 &&
                            parameters[0].ParameterType == typeof(string) &&
-                           parameters[1].ParameterType == typeof(string);
+                           parameters[1].ParameterType == typeof(string) &&
+                           parameters[2].ParameterType.IsAssignableFrom(typeof(string[]));
                 });
 
             workspaceQueryGetProjectSnapshot = query.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
@@ -1827,6 +1898,16 @@ internal sealed class FSharpHotReloadService
                 (workspaceFilesEdit == null && workspaceFilesClose == null))
             {
                 error = "FSharpWorkspace method surface is missing required members.";
+                return false;
+            }
+
+            var snapshotOption = workspaceQueryGetProjectSnapshot.ReturnType;
+            var snapshot = assembly.GetType("FSharp.Compiler.CodeAnalysis.ProjectSnapshot+FSharpProjectSnapshot");
+            if (workspaceQueryGetProjectSnapshot.GetParameters()[0].ParameterType != workspaceProjectAddOrUpdate.ReturnType ||
+                !snapshotOption.IsGenericType || snapshotOption.GetGenericTypeDefinition().FullName != "Microsoft.FSharp.Core.FSharpOption`1" ||
+                snapshotOption.GetGenericArguments()[0] != snapshot)
+            {
+                error = "FSharpWorkspace snapshot signatures are incompatible.";
                 return false;
             }
 
@@ -1964,6 +2045,13 @@ internal sealed class FSharpHotReloadService
             var arguments = new object?[_sessionApi.EmitDelta.GetParameters().Length];
             arguments[0] = projectInput;
             return InvokeResult(session, _sessionApi.EmitDelta, arguments, cancellationToken);
+        }
+
+        /// <summary>Exercises transaction methods before the probe grants compiler capability.</summary>
+        public void VerifyEmptySession(object session)
+        {
+            _sessionApi!.Commit.Invoke(session, null);
+            _sessionApi.Discard.Invoke(session, null);
         }
 
         public void SessionCommit(object session)
@@ -2315,8 +2403,19 @@ internal sealed class FSharpHotReloadService
             try
             {
                 var deltaType = delta.GetType();
-                var metadata = (byte[]?)deltaType.GetProperty("Metadata")?.GetValue(delta) ?? [];
-                var il = (byte[]?)deltaType.GetProperty("IL")?.GetValue(delta) ?? [];
+                if (!SessionObjectApi.IsDeltaShapeSupported(deltaType))
+                {
+                    throw new InvalidOperationException("The compiler returned an incompatible hot reload delta.");
+                }
+
+                var metadata = deltaType.GetProperty("Metadata")!.GetValue(delta) as byte[]
+                    ?? throw new InvalidOperationException("The compiler returned no delta metadata.");
+                var il = deltaType.GetProperty("IL")!.GetValue(delta) as byte[]
+                    ?? throw new InvalidOperationException("The compiler returned no delta IL.");
+                if (deltaType.GetProperty("RequiredCapabilities")!.GetValue(delta) is not IEnumerable<string>)
+                {
+                    throw new InvalidOperationException("The compiler returned no runtime capability requirements.");
+                }
 
                 var pdbOption = deltaType.GetProperty("Pdb")?.GetValue(delta);
                 var pdb = pdbOption == null
@@ -2658,6 +2757,36 @@ internal sealed class FSharpHotReloadService
             public required MethodInfo Discard { get; init; }
             public required MethodInfo UpdateCapabilities { get; init; }
 
+            private static bool TryGetAsyncResultValue(Type type, out Type value)
+            {
+                value = typeof(void);
+                if (!type.IsGenericType || type.GetGenericTypeDefinition().FullName != "Microsoft.FSharp.Control.FSharpAsync`1")
+                {
+                    return false;
+                }
+
+                var result = type.GetGenericArguments()[0];
+                if (!result.IsGenericType || result.GetGenericTypeDefinition().FullName != "Microsoft.FSharp.Core.FSharpResult`2" ||
+                    result.GetProperty("Tag")?.PropertyType != typeof(int) || result.GetProperty("ResultValue") == null || result.GetProperty("ErrorValue") == null)
+                {
+                    return false;
+                }
+
+                value = result.GetGenericArguments()[0];
+                return true;
+            }
+
+            internal static bool IsDeltaShapeSupported(Type type)
+            {
+                var pdb = type.GetProperty("Pdb")?.PropertyType;
+                return type.GetProperty("Metadata")?.PropertyType == typeof(byte[]) &&
+                       type.GetProperty("IL")?.PropertyType == typeof(byte[]) &&
+                       pdb is { IsGenericType: true } && pdb.GetGenericTypeDefinition().FullName == "Microsoft.FSharp.Core.FSharpOption`1" &&
+                       pdb.GetGenericArguments()[0] == typeof(byte[]) &&
+                       type.GetProperty("UpdatedTypes")?.PropertyType is { } updatedTypes && typeof(IEnumerable<int>).IsAssignableFrom(updatedTypes) &&
+                       type.GetProperty("RequiredCapabilities")?.PropertyType is { } capabilities && typeof(IEnumerable<string>).IsAssignableFrom(capabilities);
+            }
+
             public static SessionObjectApi? TryCreate(Type checkerType)
             {
                 var create = checkerType.GetMethod("CreateHotReloadSession", BindingFlags.Public | BindingFlags.Instance);
@@ -2674,6 +2803,24 @@ internal sealed class FSharpHotReloadService
                 var updateCapabilities = sessionType.GetMethod("UpdateCapabilities", BindingFlags.Public | BindingFlags.Instance);
 
                 if (addProject == null || emitDelta == null || commit == null || discard == null || updateCapabilities == null)
+                {
+                    return null;
+                }
+
+                var createParameters = create.GetParameters();
+                var addParameters = addProject.GetParameters();
+                var emitParameters = emitDelta.GetParameters();
+                var capabilityParameters = updateCapabilities.GetParameters();
+                if (createParameters.Length != 1 || createParameters[0].Name != "capabilities" || !IsFSharpOptionOfStringSequence(createParameters[0].ParameterType) ||
+                    addParameters.Length != 3 || addParameters[1].Name != "outputPath" || emitParameters.Length != 2 ||
+                    addParameters[0].ParameterType.FullName != "FSharp.Compiler.CodeAnalysis.ProjectSnapshot+FSharpProjectSnapshot" ||
+                    emitParameters[0].ParameterType != addParameters[0].ParameterType ||
+                    !addParameters.Skip(1).All(parameter => IsFSharpOptionOfString(parameter.ParameterType)) ||
+                    !IsFSharpOptionOfString(emitParameters[1].ParameterType) ||
+                    commit.ReturnType != typeof(void) || discard.ReturnType != typeof(void) || updateCapabilities.ReturnType != typeof(void) ||
+                    capabilityParameters.Length != 1 || capabilityParameters[0].ParameterType != typeof(IEnumerable<string>) ||
+                    !TryGetAsyncResultValue(addProject.ReturnType, out var addValue) || addValue.FullName != "Microsoft.FSharp.Core.Unit" ||
+                    !TryGetAsyncResultValue(emitDelta.ReturnType, out var deltaType) || !IsDeltaShapeSupported(deltaType))
                 {
                     return null;
                 }

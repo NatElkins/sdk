@@ -62,6 +62,12 @@ internal sealed class EventBasedDirectoryWatcher : DirectoryWatcher
 
         if (Directory.Exists(e.FullPath))
         {
+            // Exact-file watchers must not traverse unrelated renamed directory trees.
+            if (!IncludeSubdirectories)
+            {
+                return;
+            }
+
             foreach (var newLocation in Directory.EnumerateFiles(e.FullPath, "*", SearchOption.AllDirectories))
             {
                 // Calculated previous path of this moved item.
