@@ -23,7 +23,10 @@ internal sealed class FSharpSdkPreparation : IDisposable
 
     public bool HasFSharpProjects { get; private set; }
     public bool IsSupported { get; private set; }
+    /// <summary>Includes absent ancestor files so their creation can change SDK selection.</summary>
+    internal IReadOnlyList<string> SelectionInputs => _selectionInputs;
 
+    /// <summary>Captures SDK selection and creates an empty capability grant before project evaluation.</summary>
     public FSharpSdkPreparation(DotNetWatchContext context)
     {
         _context = context;
@@ -54,6 +57,7 @@ internal sealed class FSharpSdkPreparation : IDisposable
         return FSharpCompilerIdentity.HashFiles(dependencies);
     }
 
+    /// <summary>Requests a fresh watcher before changed SDK or compiler inputs can affect a baseline.</summary>
     public void VerifyUnchanged()
     {
         if (_selectionHash != FSharpCompilerIdentity.HashFiles(_selectionInputs) ||
@@ -68,6 +72,7 @@ internal sealed class FSharpSdkPreparation : IDisposable
         }
     }
 
+    /// <summary>Probes evaluated SDK compilers and grants experimental flags only to compatible projects.</summary>
     public void Prepare(ProjectGraph graph)
     {
         VerifyUnchanged();
@@ -142,6 +147,7 @@ internal sealed class FSharpSdkPreparation : IDisposable
     /// <summary>Verifies fallback compilation outside live output directories before the watcher stops an application.</summary>
     internal async Task<bool> PreflightAsync(IEnumerable<string> inputPaths, Func<bool> hasFurtherChanges, CancellationToken cancellationToken)
     {
+        VerifyUnchanged();
         var inputs = inputPaths.ToArray();
         var before = FSharpCompilerIdentity.HashFiles(inputs);
         var artifacts = Directory.CreateTempSubdirectory("fsharp-watch-preflight-").FullName;
@@ -188,6 +194,7 @@ internal sealed class FSharpSdkPreparation : IDisposable
         }
     }
 
+    /// <summary>Removes the private capability grant and its process environment values.</summary>
     public void Dispose()
     {
         Environment.SetEnvironmentVariable(GrantsVariable, null);

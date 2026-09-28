@@ -11,6 +11,7 @@ namespace Microsoft.DotNet.Watch;
 /// <summary>Content identity of one compiler and its adjacent dependency closure.</summary>
 internal sealed record FSharpCompilerIdentity(string CompilerPath, string ContentHash)
 {
+    /// <summary>Captures the evaluated compiler path and the contents of its adjacent dependencies.</summary>
     public static FSharpCompilerIdentity Read(string compilerPath)
     {
         compilerPath = Path.GetFullPath(compilerPath);
@@ -25,6 +26,7 @@ internal sealed record FSharpCompilerIdentity(string CompilerPath, string Conten
         return new(compilerPath, HashFiles(files));
     }
 
+    /// <summary>Hashes ordered paths and file contents, including a marker for absent files.</summary>
     internal static string HashFiles(IEnumerable<string> paths)
     {
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
@@ -45,6 +47,7 @@ internal sealed record FSharpCompilerIdentity(string CompilerPath, string Conten
         return Convert.ToHexString(hash.GetHashAndReset());
     }
 
+    /// <summary>Requests a fresh watcher if the compiler or its adjacent dependencies changed.</summary>
     public void VerifyUnchanged()
     {
         try

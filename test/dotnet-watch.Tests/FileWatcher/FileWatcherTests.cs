@@ -102,11 +102,57 @@ public class FileWatcherTests
         : DirectoryWatcher(watchedDirectory, watchedFileNames, includeSubdirectories)
     {
         public override bool EnableRaisingEvents { get; set; }
-        public override void Dispose() { }
+        public bool IsDisposed { get; private set; }
+        public override void Dispose() => IsDisposed = true;
+    }
+
+    [TestMethod]
+    public void SelectionFilesOutsideSourceTreeRemainNonrecursiveAndAreDisposed()
+    {
+        var watcher = new TestFileWatcher(new TestLogger(Output));
+        var root = SdkTestContext.Current.TestExecutionDirectory;
+        var source = Path.Combine(root, "source", "Program.fs");
+        var selection = Path.Combine(root, "global.json");
+        watcher.WatchContainingDirectories([source], includeSubdirectories: true);
+        watcher.WatchFiles([selection]);
+
+        var recursive = (TestDirectoryWatcher)watcher.DirectoryTreeWatchers.Single().Value;
+        var nonrecursive = (TestDirectoryWatcher)watcher.DirectoryWatchers.Single().Value;
+        Assert.IsFalse(nonrecursive.IncludeSubdirectories);
+        AssertEx.SequenceEqual(["global.json"], nonrecursive.WatchedFileNames);
+
+        watcher.Dispose();
+
+        Assert.IsTrue(recursive.IsDisposed);
+        Assert.IsTrue(nonrecursive.IsDisposed);
     }
 
     private static IEnumerable<string> Inspect(IReadOnlyDictionary<string, DirectoryWatcher> watchers)
         => watchers.OrderBy(w => w.Key).Select(w => $"{w.Key.TrimEnd('\\', '/')}: [{string.Join(',', w.Value.WatchedFileNames.Order())}]");
+
+    [TestMethod]
+    public void NonrecursiveSelectionWatcherIgnoresRenamedSubdirectories()
+    {
+        var directory = Directory.CreateTempSubdirectory("watch-selection-rename-");
+        try
+        {
+            using var watcher = new EventBasedDirectoryWatcher(directory.FullName, ["global.json"], includeSubdirectories: false);
+            var observed = new List<ChangedPath>();
+            watcher.OnFileChange += (_, change) => observed.Add(change);
+            var nested = Directory.CreateDirectory(Path.Combine(directory.FullName, "renamed"));
+            File.WriteAllText(Path.Combine(nested.FullName, "global.json"), "{}");
+
+            // Invoke the OS event synchronously so the assertion does not depend on a negative timeout.
+            typeof(EventBasedDirectoryWatcher).GetMethod("WatcherRenameHandler", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .Invoke(watcher, [watcher, new RenamedEventArgs(WatcherChangeTypes.Renamed, directory.FullName, "renamed", "original")]);
+
+            AssertEx.Empty(observed);
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
+    }
 
     [TestMethod]
     public void DirectoryWatcherMerging()

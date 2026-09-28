@@ -85,6 +85,11 @@ internal sealed class HotReloadDotNetWatcher
         };
 
         using var fileWatcher = new FileWatcher(_context.Logger, _context.EnvironmentOptions);
+        if (_fsharpPreparation != null)
+        {
+            // Ancestor SDK selection files need exact, nonrecursive subscriptions, including absent files.
+            fileWatcher.WatchFiles(_fsharpPreparation.SelectionInputs);
+        }
 
         for (var iteration = 0; !shutdownCancellationToken.IsCancellationRequested; iteration++)
         {
@@ -228,6 +233,7 @@ internal sealed class HotReloadDotNetWatcher
 
                 fileChangedCallback = FileChangedCallback;
                 fileWatcher.OnFileChange += fileChangedCallback;
+                _fsharpPreparation?.VerifyUnchanged();
                 _context.Logger.Log(MessageDescriptor.WaitingForChanges);
 
                 if (Test_FileChangesCompletedTask != null)
@@ -346,6 +352,9 @@ internal sealed class HotReloadDotNetWatcher
                         {
                             return [];
                         }
+
+                        // Select a fresh SDK before project evaluation can use the old MSBuild context.
+                        _fsharpPreparation?.VerifyUnchanged();
 
                         // Note:
                         // It is possible that we could have received multiple changes for a file that should cancel each other (such as Delete + Add),
@@ -765,7 +774,8 @@ internal sealed class HotReloadDotNetWatcher
         if (evaluationResult != null)
         {
             _ = await fileWatcher.WaitForFileChangeAsync(
-                evaluationResult.Files,
+                change => evaluationResult.Files.ContainsKey(change.Path) ||
+                    _fsharpPreparation?.SelectionInputs.Contains(change.Path, PathUtilities.OSSpecificPathComparer) == true,
                 startedWatching: () => _context.Logger.Log(messageDescriptor),
                 cancellationToken);
         }
@@ -791,7 +801,8 @@ internal sealed class HotReloadDotNetWatcher
         // Handle changes to files that are known to be project build inputs from its evaluation.
         // Compile items might be explicitly added by targets to directories that are excluded by default
         // (e.g. global usings in obj directory). Changes to these files should not be ignored.
-        if (evaluationResult.Files.ContainsKey(path))
+        if (evaluationResult.Files.ContainsKey(path) ||
+            _fsharpPreparation?.SelectionInputs.Contains(path, PathUtilities.OSSpecificPathComparer) == true)
         {
             return true;
         }
@@ -822,6 +833,11 @@ internal sealed class HotReloadDotNetWatcher
     private bool AcceptChange(ChangedPath change)
     {
         var (path, kind) = change;
+
+        if (_fsharpPreparation?.SelectionInputs.Contains(path, PathUtilities.OSSpecificPathComparer) == true)
+        {
+            return true;
+        }
 
         if (Path.GetExtension(path) == ".binlog")
         {

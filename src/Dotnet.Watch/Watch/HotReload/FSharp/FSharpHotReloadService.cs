@@ -295,6 +295,7 @@ internal sealed class FSharpHotReloadService : IDisposable
         return ValueTask.CompletedTask;
     }
 
+    /// <summary>Ends the session and releases compiler contexts and cached project inputs.</summary>
     public void Dispose()
     {
         EndSession();
@@ -1773,6 +1774,7 @@ internal sealed class FSharpHotReloadService : IDisposable
             }
         }
 
+        /// <summary>Releases the isolated compiler load context.</summary>
         public void Dispose() => _loadContext.Unload();
 
         private static bool ShouldUseSessionObject()
@@ -2045,6 +2047,7 @@ internal sealed class FSharpHotReloadService : IDisposable
             return InvokeResult(session, _sessionApi.EmitDelta, arguments, cancellationToken);
         }
 
+        /// <summary>Exercises transaction methods before the probe grants compiler capability.</summary>
         public void VerifyEmptySession(object session)
         {
             _sessionApi!.Commit.Invoke(session, null);

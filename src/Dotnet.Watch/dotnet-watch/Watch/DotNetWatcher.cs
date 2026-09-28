@@ -31,6 +31,7 @@ internal static class DotNetWatcher
 
         for (var iteration = 0; ; iteration++)
         {
+            compilerPreparation?.VerifyUnchanged();
             if (await buildEvaluator.EvaluateAsync(changedFile, shutdownCancellationToken) is not { } evaluationResult)
             {
                 context.Logger.LogError("Failed to find a list of files to watch");
@@ -98,10 +99,21 @@ internal static class DotNetWatcher
             using var fileSetWatcher = new FileWatcher(context.Logger, context.EnvironmentOptions);
 
             fileSetWatcher.WatchContainingDirectories(evaluationResult.Files.Keys, includeSubdirectories: true);
+            var watchedFiles = evaluationResult.Files.ToDictionary(entry => entry.Key, entry => entry.Value, PathUtilities.OSSpecificPathComparer);
+            if (compilerPreparation != null)
+            {
+                // Keep ancestor subscriptions nonrecursive and accept selection events in every wait path.
+                fileSetWatcher.WatchFiles(compilerPreparation.SelectionInputs);
+                foreach (var path in compilerPreparation.SelectionInputs)
+                {
+                    watchedFiles.TryAdd(path, new FileItem { FilePath = path, ContainingProjectPaths = [] });
+                }
+            }
+
             var inputRevision = 0;
             fileSetWatcher.OnFileChange += change =>
             {
-                if (evaluationResult.Files.ContainsKey(change.Path) || evaluationResult.ProjectGraph?.BuildFiles.Contains(change.Path) == true)
+                if (watchedFiles.ContainsKey(change.Path) || evaluationResult.ProjectGraph?.BuildFiles.Contains(change.Path) == true)
                 {
                     Interlocked.Increment(ref inputRevision);
                 }
@@ -118,7 +130,8 @@ internal static class DotNetWatcher
             {
                 while (true)
                 {
-                    fileSetTask = fileSetWatcher.WaitForFileChangeAsync(evaluationResult.Files, startedWatching: null, combinedCancellationSource.Token);
+                    fileSetTask = fileSetWatcher.WaitForFileChangeAsync(watchedFiles, startedWatching: null, combinedCancellationSource.Token);
+                    compilerPreparation?.VerifyUnchanged();
                     finishedTask = await Task.WhenAny(processTask, fileSetTask, cancelledTaskSource.Task);
 
                     if (staticFileHandler != null && finishedTask == fileSetTask && fileSetTask.Result.HasValue)
@@ -132,7 +145,7 @@ internal static class DotNetWatcher
 
                     if (compilerPreparation is { HasFSharpProjects: true } && finishedTask == fileSetTask && fileSetTask.Result.HasValue)
                     {
-                        var inputs = evaluationResult.Files.Keys.Concat(evaluationResult.ProjectGraph?.BuildFiles.AsEnumerable() ?? []);
+                        var inputs = watchedFiles.Keys.Concat(evaluationResult.ProjectGraph?.BuildFiles.AsEnumerable() ?? []);
                         bool ready;
                         int revision;
                         do
@@ -177,7 +190,7 @@ internal static class DotNetWatcher
 
                 // Now wait for a file to change before restarting process
                 changedFile = await fileSetWatcher.WaitForFileChangeAsync(
-                    evaluationResult.Files,
+                    watchedFiles,
                     startedWatching: () => context.Logger.Log(MessageDescriptor.WaitingForFileChangeBeforeRestarting),
                     shutdownCancellationToken);
             }
