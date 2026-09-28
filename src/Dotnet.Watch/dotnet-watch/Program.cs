@@ -37,6 +37,14 @@ internal sealed class Program(
 
             var sdkRootDirectory = EnvironmentVariables.SdkRootDirectory;
 
+            if (Environment.GetEnvironmentVariable("FSHARP_WATCH_SDK_DIRECTORY") != null)
+            {
+                // SDK tasks can require newer NuGet assemblies than this independently versioned tool.
+                // Keep their dependencies in MSBuild's task context before its loader reads these switches.
+                Environment.SetEnvironmentVariable("MSBUILDUSECUSTOMLOADCONTEXTFORDEPENDENCIESINTOOLSDIRECTORY", "1");
+                Environment.SetEnvironmentVariable("MSBUILDSINGLELOADCONTEXT", "0");
+            }
+
             // We can register the MSBuild that is bundled with the SDK to perform MSBuild things.
             // In production deployment dotnet-watch is in a nested folder of the SDK's root, we'll back up to it.
             // AppContext.BaseDirectory = $sdkRoot\$sdkVersion\DotnetTools\dotnet-watch\$version\tools\net6.0\any\

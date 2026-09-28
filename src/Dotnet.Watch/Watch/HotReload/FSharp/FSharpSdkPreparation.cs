@@ -17,6 +17,7 @@ internal sealed class FSharpSdkPreparation : IDisposable
     private readonly string _grantsPath;
     private readonly string[] _selectionInputs;
     private readonly string _selectionHash;
+    private readonly string _sdkHash;
     private ImmutableArray<FSharpCompilerIdentity> _identities = [];
     private string? _assignments;
 
@@ -37,19 +38,26 @@ internal sealed class FSharpSdkPreparation : IDisposable
             inputs.Add(Path.Combine(directory.FullName, "global.json"));
         }
 
-        if (context.EnvironmentOptions.SdkDirectory is { } sdk)
-        {
-            inputs.Add(Path.Combine(sdk, "MSBuild.dll"));
-            inputs.Add(Path.Combine(sdk, "MSBuild.runtimeconfig.json"));
-        }
-
         _selectionInputs = [.. inputs];
         _selectionHash = FSharpCompilerIdentity.HashFiles(_selectionInputs);
+        _sdkHash = ReadSdkIdentity(context.EnvironmentOptions.SdkDirectory!);
+    }
+
+    /// <summary>Tracks SDK build dependencies that remain loaded for the lifetime of this watcher.</summary>
+    internal static string ReadSdkIdentity(string sdkDirectory)
+    {
+        // Task isolation allows SDK NuGet versions to differ from the tool. A replacement requires a fresh task context.
+        var dependencies = Directory.EnumerateFiles(sdkDirectory).Where(path =>
+            Path.GetFileName(path).StartsWith("NuGet.", StringComparison.OrdinalIgnoreCase) ||
+            Path.GetFileName(path).StartsWith("Microsoft.Build.", StringComparison.OrdinalIgnoreCase) ||
+            Path.GetFileName(path).StartsWith("MSBuild.", StringComparison.OrdinalIgnoreCase));
+        return FSharpCompilerIdentity.HashFiles(dependencies);
     }
 
     public void VerifyUnchanged()
     {
-        if (_selectionHash != FSharpCompilerIdentity.HashFiles(_selectionInputs))
+        if (_selectionHash != FSharpCompilerIdentity.HashFiles(_selectionInputs) ||
+            _sdkHash != ReadSdkIdentity(_context.EnvironmentOptions.SdkDirectory!))
         {
             throw new FSharpCompilerChangedException();
         }

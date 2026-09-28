@@ -11,6 +11,31 @@ namespace Microsoft.DotNet.Watch.UnitTests;
 public class FSharpSdkCompilerTests
 {
     [TestMethod]
+    [DataRow("NuGet.Versioning.dll")]
+    [DataRow("Microsoft.Build.Framework.dll")]
+    [DataRow("MSBuild.runtimeconfig.json")]
+    public void SdkIdentityDetectsDependencyReplacementWithSameSizeAndTimestamp(string changedFile)
+    {
+        var directory = Directory.CreateTempSubdirectory("watch-sdk-identity-");
+        try
+        {
+            var changedPath = Path.Combine(directory.FullName, changedFile);
+            File.WriteAllText(changedPath, "original");
+            var timestamp = File.GetLastWriteTimeUtc(changedPath);
+            var original = FSharpSdkPreparation.ReadSdkIdentity(directory.FullName);
+
+            File.WriteAllText(changedPath, "modified");
+            File.SetLastWriteTimeUtc(changedPath, timestamp);
+
+            Assert.AreNotEqual(original, FSharpSdkPreparation.ReadSdkIdentity(directory.FullName));
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
+    }
+
+    [TestMethod]
     [DataRow("fsc.dll")]
     [DataRow("FSharp.Core.dll")]
     [DataRow("fsc.deps.json")]
