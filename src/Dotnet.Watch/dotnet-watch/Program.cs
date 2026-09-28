@@ -28,6 +28,13 @@ internal sealed class Program(
     {
         try
         {
+            if (args is ["--fsharp-watch-probe", var compilerPath])
+            {
+                var probe = FSharpHotReloadService.ProbeCompiler(compilerPath, Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
+                Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(probe, new System.Text.Json.JsonSerializerOptions { PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase }));
+                return 0;
+            }
+
             var sdkRootDirectory = EnvironmentVariables.SdkRootDirectory;
 
             // We can register the MSBuild that is bundled with the SDK to perform MSBuild things.
@@ -294,6 +301,11 @@ internal sealed class Program(
         {
             // Ctrl+C forced an exit
             return 0;
+        }
+        catch (FSharpCompilerChangedException) when (!shutdownHandler.CancellationToken.IsCancellationRequested)
+        {
+            logger.LogInformation("SDK or compiler identity changed. Ending the current watch session.");
+            return 75;
         }
         catch (Exception e)
         {

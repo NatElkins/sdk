@@ -12,6 +12,9 @@ internal static class DotNetWatcher
 {
     public static async Task WatchAsync(DotNetWatchContext context, CancellationToken shutdownCancellationToken)
     {
+        using var compilerPreparation = Environment.GetEnvironmentVariable("FSHARP_WATCH_SDK_DIRECTORY") != null
+            ? new FSharpSdkPreparation(context)
+            : null;
         var cancelledTaskSource = new TaskCompletionSource();
         shutdownCancellationToken.Register(state => ((TaskCompletionSource)state!).TrySetResult(),
             cancelledTaskSource);
@@ -26,7 +29,7 @@ internal static class DotNetWatcher
         ChangedFile? changedFile = null;
         var buildEvaluator = new BuildEvaluator(context);
 
-        for (var iteration = 0;;iteration++)
+        for (var iteration = 0; ; iteration++)
         {
             if (await buildEvaluator.EvaluateAsync(changedFile, shutdownCancellationToken) is not { } evaluationResult)
             {
@@ -38,6 +41,7 @@ internal static class DotNetWatcher
             ProjectGraphNode? projectRootNode;
             if (evaluationResult.ProjectGraph != null)
             {
+                compilerPreparation?.Prepare(evaluationResult.ProjectGraph.Graph);
                 projectRootNode = evaluationResult.ProjectGraph.Graph.GraphRoots.Single();
                 staticFileHandler = new StaticFileHandler(context.Logger, evaluationResult.ProjectGraph, context.BrowserRefreshServerFactory);
             }
@@ -94,36 +98,72 @@ internal static class DotNetWatcher
             using var fileSetWatcher = new FileWatcher(context.Logger, context.EnvironmentOptions);
 
             fileSetWatcher.WatchContainingDirectories(evaluationResult.Files.Keys, includeSubdirectories: true);
+            var inputRevision = 0;
+            fileSetWatcher.OnFileChange += change =>
+            {
+                if (evaluationResult.Files.ContainsKey(change.Path) || evaluationResult.ProjectGraph?.BuildFiles.Contains(change.Path) == true)
+                {
+                    Interlocked.Increment(ref inputRevision);
+                }
+            };
 
             var processTask = context.ProcessRunner.RunAsync(processSpec, context.Logger, launchResult: null, combinedCancellationSource.Token);
 
-            Task<ChangedFile?> fileSetTask;
-            Task finishedTask;
+            Task<ChangedFile?> fileSetTask = Task.FromResult<ChangedFile?>(null);
+            Task finishedTask = Task.CompletedTask;
 
             context.Logger.Log(MessageDescriptor.WaitingForChanges);
 
-            while (true)
+            try
             {
-                fileSetTask = fileSetWatcher.WaitForFileChangeAsync(evaluationResult.Files, startedWatching: null, combinedCancellationSource.Token);
-                finishedTask = await Task.WhenAny(processTask, fileSetTask, cancelledTaskSource.Task);
-
-                if (staticFileHandler != null && finishedTask == fileSetTask && fileSetTask.Result.HasValue)
+                while (true)
                 {
-                    if (await staticFileHandler.HandleFileChangesAsync([fileSetTask.Result.Value], combinedCancellationSource.Token))
+                    fileSetTask = fileSetWatcher.WaitForFileChangeAsync(evaluationResult.Files, startedWatching: null, combinedCancellationSource.Token);
+                    finishedTask = await Task.WhenAny(processTask, fileSetTask, cancelledTaskSource.Task);
+
+                    if (staticFileHandler != null && finishedTask == fileSetTask && fileSetTask.Result.HasValue)
                     {
-                        // We're able to handle the file change event without doing a full-rebuild.
-                        continue;
+                        if (await staticFileHandler.HandleFileChangesAsync([fileSetTask.Result.Value], combinedCancellationSource.Token))
+                        {
+                            // We're able to handle the file change event without doing a full-rebuild.
+                            continue;
+                        }
                     }
+
+                    if (compilerPreparation is { HasFSharpProjects: true } && finishedTask == fileSetTask && fileSetTask.Result.HasValue)
+                    {
+                        var inputs = evaluationResult.Files.Keys.Concat(evaluationResult.ProjectGraph?.BuildFiles.AsEnumerable() ?? []);
+                        bool ready;
+                        int revision;
+                        do
+                        {
+                            revision = Volatile.Read(ref inputRevision);
+                            // A correction during preflight must be checked without another file event.
+                            ready = await compilerPreparation.PreflightAsync(inputs, () => revision != Volatile.Read(ref inputRevision), combinedCancellationSource.Token);
+                        }
+                        while (revision != Volatile.Read(ref inputRevision));
+
+                        if (!ready)
+                        {
+                            continue;
+                        }
+                    }
+
+                    break;
                 }
-
-                break;
             }
-
-            // Regardless of the which task finished first, make sure everything is cancelled
-            // and wait for dotnet to exit. We don't want orphan processes
-            currentRunCancellationSource.Cancel();
-
-            await Task.WhenAll(processTask, fileSetTask);
+            finally
+            {
+                // Compiler replacement also leaves this loop. Always terminate the old process before exit 75.
+                currentRunCancellationSource.Cancel();
+                try
+                {
+                    await Task.WhenAll(processTask, fileSetTask);
+                }
+                catch (OperationCanceledException) when (combinedCancellationSource.IsCancellationRequested)
+                {
+                }
+            }
 
             if (finishedTask == cancelledTaskSource.Task || shutdownCancellationToken.IsCancellationRequested)
             {

@@ -74,7 +74,7 @@ internal sealed class CompilationHandler : IDisposable
     public void Dispose()
     {
         _isDisposed = true;
-        _fsharpHotReloadService.EndSession();
+        _fsharpHotReloadService.Dispose();
         Workspace?.Dispose();
     }
 
