@@ -108,5 +108,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name == 'main' && 'feature/fsharp-watch-global-tool' || github.ref }}
       - name: Verify the standalone build and compiler bridge units
         run: python3 scripts/fsharp-watch-verify.py
