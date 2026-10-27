@@ -1,0 +1,112 @@
+name: Update standalone F# watch upstream source
+
+on:
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      verify_only:
+        description: Verify the selected branch without a source update
+        type: boolean
+        default: false
+  pull_request:
+    branches:
+      - feature/fsharp-watch-global-tool
+      - fsharp-hotreload-watch-v2
+    paths:
+      - src/Dotnet.Watch/**
+      - test/dotnet-watch.Tests/**
+      - .github/workflows/fsharp-watch-sync.yml
+      - scripts/fsharp-watch-verify.py
+      - Directory.Packages.props
+      - eng/ManualVersions.props
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_SESSIONID: gha-${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+  DOTNET_ADD_GLOBAL_TOOLS_TO_PATH: '0'
+
+concurrency:
+  group: fsharp-watch-upstream-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'NatElkins/sdk' && github.event_name != 'pull_request' && !inputs.verify_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BASE_BRANCH: feature/fsharp-watch-global-tool
+      SYNC_BRANCH: sync/fsharp-watch-upstream
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: feature/fsharp-watch-global-tool
+          fetch-depth: 0
+
+      - name: Merge upstream into a separate update branch
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add watch-upstream https://github.com/dotnet/sdk.git
+          git fetch watch-upstream main
+          if git merge-base --is-ancestor watch-upstream/main "origin/$BASE_BRANCH"; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git ls-remote --exit-code --heads origin "$SYNC_BRANCH" >/dev/null 2>&1; then
+            git fetch origin "refs/heads/$SYNC_BRANCH:refs/remotes/origin/$SYNC_BRANCH"
+            git switch -c "$SYNC_BRANCH" "origin/$SYNC_BRANCH"
+            if ! git merge --no-edit "origin/$BASE_BRANCH"; then
+              echo 'The update branch conflicts with the maintained engine. Resolve the branch before another update.' >> "$GITHUB_STEP_SUMMARY"
+              git diff --name-only --diff-filter=U >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          else
+            git switch -c "$SYNC_BRANCH"
+          fi
+          if ! git merge --no-ff -m 'Merge current SDK main into the standalone F# watch engine' watch-upstream/main; then
+            echo 'Current SDK main conflicts with the F# watch engine. The maintained branch remains unchanged.' >> "$GITHUB_STEP_SUMMARY"
+            git diff --name-only --diff-filter=U >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Create or update the upstream PR
+        if: steps.source.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:refs/heads/$SYNC_BRANCH"
+          existing=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$SYNC_BRANCH" --base "$BASE_BRANCH" --state open --json number --jq '.[0].number // empty')
+          if test -z "$existing"; then
+            cat > "$RUNNER_TEMP/fsharp-watch-upstream-pr.md" <<'BODY'
+          This merges current dotnet/sdk main into the standalone F# watch engine.
+          The maintained branch remains unchanged until this PR merges.
+
+          Focused compiler bridge tests verify this candidate.
+          The package pipeline separately verifies installed hot reload before release.
+          BODY
+            gh pr create --repo "$GITHUB_REPOSITORY" --base "$BASE_BRANCH" --head "$SYNC_BRANCH" --draft --title 'Update the standalone F# watch engine from SDK main' --body-file "$RUNNER_TEMP/fsharp-watch-upstream-pr.md"
+          fi
+          # Dispatch explicitly because token-generated pushes suppress push workflows.
+          gh workflow run fsharp-watch-sync.yml --repo "$GITHUB_REPOSITORY" --ref "$SYNC_BRANCH" -f verify_only=true
+
+  verify:
+    if: github.repository == 'NatElkins/sdk' && (github.event_name == 'pull_request' || inputs.verify_only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify the standalone build and compiler bridge units
+        run: python3 scripts/fsharp-watch-verify.py
