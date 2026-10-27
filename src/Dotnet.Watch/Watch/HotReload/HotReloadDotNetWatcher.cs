@@ -255,6 +255,7 @@ internal sealed class HotReloadDotNetWatcher
                     {
                         Logger = _context.Logger,
                         HotReloadService = workspace.HotReloadService,
+                        FSharpHotReloadService = workspace.FSharpHotReloadService,
                         ManagedCodeSnapshot = workspace.CurrentSnapshot,
                         RunningProjects = runningProjectsManager.CurrentRunningProjects
                     };
@@ -264,6 +265,8 @@ internal sealed class HotReloadDotNetWatcher
                     await updatesBuilder.AddStaticAssetUpdatesAsync(changedFiles, evaluationResult, stopwatch, iterationCancellationToken);
 
                     await updatesBuilder.AddManagedCodeUpdatesAsync(
+                        changedFiles,
+                        evaluationResult.ProjectGraph,
                         restartPrompt: async (projectNames, cancellationToken) =>
                         {
                             // stop before waiting for user input:
@@ -1256,6 +1259,7 @@ internal sealed class HotReloadDotNetWatcher
         };
 
         arguments.AddRange(_context.BuildArguments);
+        arguments.Add($"-p:{FSharpHotReloadService.WatchBuildPropertyName}=true");
 
         if (action != BuildAction.RestoreOnly && targetFramework != null)
         {

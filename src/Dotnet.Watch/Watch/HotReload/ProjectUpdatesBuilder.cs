@@ -16,21 +16,22 @@ internal sealed partial class ProjectUpdatesBuilder
 {
     public required ILogger Logger { get; init; }
     public required HotReloadService HotReloadService { get; init; }
+    public required FSharpHotReloadService FSharpHotReloadService { get; init; }
 
     // inputs:
     public required ManagedCodeSnapshot ManagedCodeSnapshot { get; init; }
     public required ImmutableDictionary<string, ImmutableArray<RunningProject>> RunningProjects { get; init; }
 
     // outputs:
-    private readonly List<ProjectId> _previousProjectUpdatesToDiscard = [];
-    private readonly List<HotReloadService.Update> _managedCodeUpdates = [];
+    private readonly List<string> _previousProjectUpdatesToDiscard = [];
+    private readonly List<ManagedCodeUpdateEnvelope> _managedCodeUpdates = [];
     private readonly Dictionary<RunningProject, List<StaticWebAsset>> _staticAssetUpdates = [];
     private readonly List<string> _projectsToRebuild = [];
     private readonly List<string> _projectsToRedeploy = [];
     private readonly List<RunningProject> _projectsToRestart = [];
 
-    public IReadOnlyList<ProjectId> PreviousProjectUpdatesToDiscard => _previousProjectUpdatesToDiscard;
-    public IReadOnlyList<HotReloadService.Update> ManagedCodeUpdates => _managedCodeUpdates;
+    public IReadOnlyList<string> PreviousProjectUpdatesToDiscard => _previousProjectUpdatesToDiscard;
+    public IReadOnlyList<ManagedCodeUpdateEnvelope> ManagedCodeUpdates => _managedCodeUpdates;
     public IReadOnlyDictionary<RunningProject, List<StaticWebAsset>> StaticAssetUpdates => _staticAssetUpdates;
     public IReadOnlyList<string> ProjectsToRebuild => _projectsToRebuild;
     public IReadOnlyList<string> ProjectsToRedeploy => _projectsToRedeploy;
@@ -41,6 +42,7 @@ internal sealed partial class ProjectUpdatesBuilder
 
     private async ValueTask DisplayResultsAsync(
         HotReloadService.Updates updates,
+        FSharpManagedUpdateResult fsharpResult,
         ImmutableDictionary<ProjectId, HotReloadService.RunningProjectInfo> runningProjectInfos,
         CancellationToken cancellationToken)
     {
@@ -50,7 +52,7 @@ internal sealed partial class ProjectUpdatesBuilder
                 break;
 
             case HotReloadService.Status.NoChangesToApply:
-                Logger.Log(MessageDescriptor.NoManagedCodeChangesToApply);
+                // The combined Roslyn and F# result determines whether this batch contains changes.
                 break;
 
             case HotReloadService.Status.Blocked:
@@ -72,6 +74,21 @@ internal sealed partial class ProjectUpdatesBuilder
         ReportCompilationDiagnostics(DiagnosticSeverity.Error);
         ReportCompilationDiagnostics(DiagnosticSeverity.Warning);
         ReportRudeEdits();
+
+        // The F# service reports console messages. Include its issues in the same browser update as Roslyn.
+        foreach (var issue in fsharpResult.Issues)
+        {
+            if (!string.IsNullOrEmpty(issue.Message))
+            {
+                var message = $"[{Path.GetFileNameWithoutExtension(issue.ProjectPath)}] {issue.Message}";
+                if (issue.Message.Contains("FSHRDL", StringComparison.Ordinal))
+                {
+                    message += $" Learn more: {FSharpHotReloadService.RudeEditHelpLink}";
+                }
+
+                errorsToDisplayInApp.Add(message);
+            }
+        }
 
         // report or clear diagnostics in the browser UI
         await RunningProjects.ForEachValueAsync(
@@ -221,62 +238,101 @@ internal sealed partial class ProjectUpdatesBuilder
     }
 
     public async ValueTask AddManagedCodeUpdatesAsync(
+        IReadOnlyList<ChangedFile> changedFiles,
+        LoadedProjectGraph projectGraph,
         Func<IEnumerable<string>, CancellationToken, Task<bool>> restartPrompt,
         bool autoRestart,
         CancellationToken cancellationToken)
     {
-        // Note that for scenarios where RunningProject has multiple managed clients (e.g. Blazor WASM hosted),
-        // it is sufficient to set RestartWhenChangesHaveNoEffect for the primary running project, as all secondary managed clients
-        // are associated with projects that are referenced by the the primary project and thus any updates in their cones are already
-        // considered updates that affect a running project (the primary one).
+        // F# projects use their compiler session. Roslyn reports ENC1009 if it owns an F# update.
         var runningProjectInfos =
            (from project in Solution.Projects
             let runningProject = GetCorrespondingRunningProjects(project).FirstOrDefault()
-            where runningProject != null
+            where runningProject != null && ShouldRoslynProcessProject(project)
             let autoRestartProject = autoRestart || runningProject.ProjectNode.IsAutoRestartEnabled()
             select (project.Id, info: new HotReloadService.RunningProjectInfo() { RestartWhenChangesHaveNoEffect = autoRestartProject }))
             .ToImmutableDictionary(e => e.Id, e => e.info);
 
         var updates = await HotReloadService.GetUpdatesAsync(Solution, runningProjectInfos, cancellationToken);
-        var hasPendingUpdate = updates.Status is not (HotReloadService.Status.NoChangesToApply or HotReloadService.Status.Blocked);
-
+        var hasPendingUpdate = updates.Status == HotReloadService.Status.ReadyToApply;
+        var fsharpResult = default(FSharpManagedUpdateResult);
         var success = false;
         try
         {
-            await DisplayResultsAsync(updates, runningProjectInfos, cancellationToken);
+            fsharpResult = await FSharpHotReloadService.TryEmitUpdatesAsync(changedFiles, RunningProjects, cancellationToken);
+            await DisplayResultsAsync(updates, fsharpResult, runningProjectInfos, cancellationToken);
 
-            if (!hasPendingUpdate)
+            if (updates.Status == HotReloadService.Status.Blocked || fsharpResult.Status == FSharpManagedUpdateStatus.Blocked)
             {
-                // If Hot Reload is blocked (due to compilation error) we ignore the current
-                // changes and await the next file change.
-
-                // Note: CommitUpdate/DiscardUpdate is not expected to be called.
+                // Neither compiler can retain a staged update when the other compiler blocks the batch.
                 return;
             }
+
+            if (!hasPendingUpdate && fsharpResult.Updates.IsEmpty && fsharpResult.Issues.IsEmpty)
+            {
+                Logger.Log(MessageDescriptor.NoManagedCodeChangesToApply);
+                return;
+            }
+
+            var fsharpRestartPaths = fsharpResult.Issues
+                .SelectMany(issue => GetFSharpRestartProjectPaths(issue.ProjectPath, projectGraph))
+                .Distinct(PathUtilities.OSSpecificPathComparer)
+                .ToImmutableArray();
 
             var projectsToPromptForRestart =
                 (from projectId in updates.ProjectsToRestart.Keys
-                 where !runningProjectInfos[projectId].RestartWhenChangesHaveNoEffect // equivalent to auto-restart
+                 where !runningProjectInfos[projectId].RestartWhenChangesHaveNoEffect
                  select Solution.GetProject(projectId)!.Name).ToList();
 
-            if (projectsToPromptForRestart.Any() &&
-                !await restartPrompt.Invoke(projectsToPromptForRestart, cancellationToken))
+            if (!autoRestart)
+            {
+                projectsToPromptForRestart.AddRange(
+                    from path in fsharpRestartPaths
+                    where RunningProjects.TryGetValue(path, out var projects) && projects.Any(static project => !project.ProjectNode.IsAutoRestartEnabled())
+                    select Path.GetFileNameWithoutExtension(path));
+            }
+
+            if (projectsToPromptForRestart.Count > 0 &&
+                !await restartPrompt.Invoke(projectsToPromptForRestart.Distinct(StringComparer.Ordinal), cancellationToken))
             {
                 Logger.Log(MessageDescriptor.HotReloadSuspended);
                 await Task.Delay(-1, cancellationToken);
-
                 return;
             }
 
+            _projectsToRebuild.AddRange(updates.ProjectsToRebuild.Select(GetRequiredProjectFilePath));
+            _projectsToRebuild.AddRange(fsharpResult.Issues.Select(static issue => issue.ProjectPath));
+            _previousProjectUpdatesToDiscard.AddRange(_projectsToRebuild);
+            _projectsToRedeploy.AddRange(updates.ProjectsToRedeploy.Select(GetRequiredProjectFilePath));
+            _projectsToRestart.AddRange(
+                updates.ProjectsToRestart.Keys.Select(GetRequiredProjectFilePath)
+                    .Concat(fsharpRestartPaths)
+                    .Distinct(PathUtilities.OSSpecificPathComparer)
+                    .SelectMany(path => RunningProjects.TryGetValue(path, out var projects) ? projects : []));
+
+            if (!fsharpResult.Issues.IsEmpty && updates.ProjectsToRestart.IsEmpty)
+            {
+                Logger.Log(MessageDescriptor.RestartNeededToApplyChanges);
+            }
+
+            foreach (var issue in fsharpResult.Issues)
+            {
+                Logger.LogDebug("F# managed update fallback reason for '{ProjectPath}': {Message}", issue.ProjectPath, issue.Message);
+            }
+
+            _managedCodeUpdates.AddRange(updates.ProjectUpdates.Select(update => new ManagedCodeUpdateEnvelope(
+                GetRequiredProjectFilePath(update.ProjectId),
+                new HotReloadManagedCodeUpdate(update.ModuleId, update.MetadataDelta, update.ILDelta, update.PdbDelta, update.UpdatedTypes, update.RequiredCapabilities))));
+            _managedCodeUpdates.AddRange(fsharpResult.Updates.Select(static update => new ManagedCodeUpdateEnvelope(update.ProjectPath, update.Update)));
             success = true;
         }
         finally
         {
+            // Both compilers commit at hand-off. The runtime apply path recovers failures through a fresh process and baseline.
             if (hasPendingUpdate)
             {
                 if (success)
                 {
-                    // Note: Releases locked project baseline readers, so we can rebuild any projects that need rebuilding.
                     HotReloadService.CommitUpdate();
                 }
                 else
@@ -284,17 +340,35 @@ internal sealed partial class ProjectUpdatesBuilder
                     HotReloadService.DiscardUpdate();
                 }
             }
+
+            if (success && !fsharpResult.Updates.IsDefaultOrEmpty)
+            {
+                FSharpHotReloadService.CommitUpdates();
+            }
+            else
+            {
+                FSharpHotReloadService.DiscardUpdates();
+            }
         }
+    }
 
-        _previousProjectUpdatesToDiscard.AddRange(updates.ProjectsToRebuild);
-        _managedCodeUpdates.AddRange(updates.ProjectUpdates);
-        _projectsToRebuild.AddRange(updates.ProjectsToRebuild.Select(GetRequiredProjectFilePath));
-        _projectsToRedeploy.AddRange(updates.ProjectsToRedeploy.Select(GetRequiredProjectFilePath));
+    private bool ShouldRoslynProcessProject(Project project)
+        => project.Language is LanguageNames.CSharp or LanguageNames.VisualBasic ||
+           (!FSharpHotReloadService.IsEnabled && string.Equals(project.Language, "F#", StringComparison.OrdinalIgnoreCase));
 
-        // Terminate all tracked processes that need to be restarted,
-        // except for the root process, which will terminate later on.
-        _projectsToRestart.AddRange(
-            updates.ProjectsToRestart.SelectMany(e => RunningProjects.TryGetValue(GetRequiredProjectFilePath(e.Key), out var array) ? array : []));
+    private static ImmutableArray<string> GetFSharpRestartProjectPaths(string projectPath, LoadedProjectGraph projectGraph)
+    {
+        var nodes = projectGraph.Graph.ProjectNodes
+            .Where(node => node.ProjectInstance.GetTargetFramework() != "" &&
+                PathUtilities.OSSpecificPathComparer.Equals(node.ProjectInstance.FullPath, projectPath))
+            .ToImmutableArray();
+
+        // A library rude edit also invalidates every application that statically references the library.
+        return nodes.IsEmpty
+            ? [projectPath]
+            : [.. nodes.SelectMany(static node => node.GetAncestorsAndSelf())
+                .Select(static node => node.ProjectInstance.FullPath)
+                .Distinct(PathUtilities.OSSpecificPathComparer)];
     }
 
     private string GetRequiredProjectFilePath(ProjectId projectId)

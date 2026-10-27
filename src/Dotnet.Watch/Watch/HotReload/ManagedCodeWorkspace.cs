@@ -17,6 +17,9 @@ internal sealed class ManagedCodeWorkspace : IDisposable
     private readonly HotReloadMSBuildWorkspace _workspace;
     public readonly HotReloadService HotReloadService;
 
+    /// <summary>Owns F# compiler sessions for the same project graph and runtime capabilities.</summary>
+    public readonly FSharpHotReloadService FSharpHotReloadService;
+
     private int _solutionUpdateId;
 
     /// <summary>
@@ -32,10 +35,12 @@ internal sealed class ManagedCodeWorkspace : IDisposable
         _runningProjectsManager = runningProjectsManager;
         _workspace = new HotReloadMSBuildWorkspace(logger, projectFile => (instances: _projectInstances.GetValueOrDefault(projectFile, []), project: null));
         HotReloadService = new HotReloadService(_workspace.CurrentSolution.Services, () => ValueTask.FromResult(GetAggregateCapabilities()));
+        FSharpHotReloadService = new FSharpHotReloadService(logger, GetAggregateCapabilities);
     }
 
     public void Dispose()
     {
+        FSharpHotReloadService.EndSession();
         _workspace.Dispose();
     }
 
@@ -78,6 +83,7 @@ internal sealed class ManagedCodeWorkspace : IDisposable
         var solution = await UpdateProjectGraphAsync(graph, cancellationToken);
 
         await HotReloadService.StartSessionAsync(solution, cancellationToken);
+        await FSharpHotReloadService.StartSessionAsync(cancellationToken);
 
         _logger.Log(MessageDescriptor.HotReloadSessionStarted);
     }
@@ -85,6 +91,7 @@ internal sealed class ManagedCodeWorkspace : IDisposable
     public async Task<Solution> UpdateProjectGraphAsync(ProjectGraph projectGraph, CancellationToken cancellationToken)
     {
         _projectInstances = CreateProjectInstanceMap(projectGraph);
+        FSharpHotReloadService.UpdateProjects(projectGraph);
 
         var solution = await _workspace.UpdateProjectGraphAsync([.. projectGraph.EntryPointNodes.Select(n => n.ProjectInstance.FullPath)], cancellationToken);
         await SolutionUpdatedAsync(solution, "project update", cancellationToken);
@@ -100,7 +107,11 @@ internal sealed class ManagedCodeWorkspace : IDisposable
 
     public async Task UpdateFileContentAsync(IReadOnlyList<ChangedFile> changedFiles, CancellationToken cancellationToken)
     {
-        var solution = await _workspace.UpdateFileContentAsync(changedFiles.Select(static f => (f.Item.FilePath, f.Kind.Convert())), cancellationToken);
+        // Roslyn cannot apply F# edits. The F# session owns these files and preserves its committed baseline.
+        var roslynChangedFiles = changedFiles
+            .Where(file => !FSharpHotReloadService.OwnsChangedFile(file))
+            .Select(static file => (file.Item.FilePath, file.Kind.Convert()));
+        var solution = await _workspace.UpdateFileContentAsync(roslynChangedFiles, cancellationToken);
         await SolutionUpdatedAsync(solution, "document update", cancellationToken);
     }
 

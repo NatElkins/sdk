@@ -43,7 +43,7 @@ internal sealed class RunningProjectsManager(ProcessRunner processRunner, ILogge
     /// <summary>
     /// All updates that were attempted. Includes updates whose application failed.
     /// </summary>
-    private ImmutableList<HotReloadService.Update> _previousUpdates = [];
+    private ImmutableList<ManagedCodeUpdateEnvelope> _previousUpdates = [];
 
     public ImmutableDictionary<string, ImmutableArray<RunningProject>> CurrentRunningProjects
         => _runningProjects;
@@ -262,7 +262,8 @@ internal sealed class RunningProjectsManager(ProcessRunner processRunner, ILogge
             // If we missed any project that dynamically references one of these modules its rebuild will fail.
             // At this point there is thus no process that these modules loaded and any process created in future
             // that will load their rebuilt versions.
-            _previousUpdates = _previousUpdates.RemoveAll(update => builder.PreviousProjectUpdatesToDiscard.Contains(update.ProjectId));
+            var rebuiltProjects = builder.PreviousProjectUpdatesToDiscard.ToHashSet(PathUtilities.OSSpecificPathComparer);
+            _previousUpdates = _previousUpdates.RemoveAll(update => rebuiltProjects.Contains(update.ProjectPath));
 
             // Adding the updates makes sure that all new processes receive them before they are added to running processes.
             _previousUpdates = _previousUpdates.AddRange(builder.ManagedCodeUpdates);
@@ -497,9 +498,9 @@ internal sealed class RunningProjectsManager(ProcessRunner processRunner, ILogge
         return relaunchOperations;
     }
 
-    private static ImmutableArray<ImmutableArray<HotReloadManagedCodeUpdate>> ToManagedCodeUpdates(HotReloadClients clients, IEnumerable<HotReloadService.Update> updates)
+    private static ImmutableArray<ImmutableArray<HotReloadManagedCodeUpdate>> ToManagedCodeUpdates(HotReloadClients clients, IEnumerable<ManagedCodeUpdateEnvelope> updates)
     {
-        var updatesForClient = updates.Select(update => new HotReloadManagedCodeUpdate(update.ModuleId, update.MetadataDelta, update.ILDelta, update.PdbDelta, update.UpdatedTypes, update.RequiredCapabilities));
+        var updatesForClient = updates.Select(static update => update.Update);
 
         // The updates are the same for all clients since the debugger isn't attached:
         return [.. Enumerable.Repeat(updatesForClient.ToImmutableArray(), clients.Clients.Length)];

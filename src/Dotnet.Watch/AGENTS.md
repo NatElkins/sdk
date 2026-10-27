@@ -168,9 +168,10 @@ Reload).
   continue to use the separate `Microsoft.Extensions.DotNetDeltaApplier` startup hook.
   Do not restore response rewriting, application-hosted browser scripts, or parallel
   legacy endpoints.
-- **`CompilationHandler` drives Roslyn** via
-  `Microsoft.CodeAnalysis.ExternalAccess.HotReload`; unsupported edits fall
-  back to a full rebuild + restart.
+- **`ManagedCodeWorkspace` owns compiler sessions.** Roslyn uses
+  `Microsoft.CodeAnalysis.ExternalAccess.HotReload`. F# uses `FSharpHotReloadService`.
+  `ProjectUpdatesBuilder` combines updates and restart requests from both compilers.
+  `RunningProjectsManager` delivers updates and retains them for new processes.
 
 ## Tests
 
