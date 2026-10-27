@@ -37,7 +37,8 @@ internal sealed class FSharpHotReloadService
     /// <summary>Preserves the F# opt-in property after upstream removed its watch-wide use.</summary>
     internal const string WatchBuildPropertyName = "DotNetWatchBuild";
 
-    private const string RudeEditHelpLink = "https://github.com/dotnet/fsharp/blob/main/docs/hot-reload-rude-edits.md";
+    /// <summary>Uses published preview documentation until the compiler reference reaches upstream main.</summary>
+    internal const string RudeEditHelpLink = "https://github.com/NatElkins/fsharp/blob/413be4377c3dd88abe08c2bbb6e9f4b285a06a1e/docs/hot-reload-rude-edits.md";
 
     private readonly ILogger _logger;
     private readonly bool _trace;

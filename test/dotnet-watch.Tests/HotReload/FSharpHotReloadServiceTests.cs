@@ -3,6 +3,8 @@
 
 using System.Collections.Immutable;
 using System.Reflection;
+using System.Text.Json;
+using Microsoft.CodeAnalysis;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.DotNet.HotReload;
 
@@ -12,6 +14,94 @@ namespace Microsoft.DotNet.Watch.UnitTests;
 public class FSharpHotReloadServiceTests
 {
     [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task BrowserDiagnosticsIncludeFSharpIssuesAndClearAfterRecovery(bool compilationBlocked)
+    {
+        await using var browser = new DiagnosticBrowserRefreshServer();
+        var clients = new HotReloadClients([], browser, useRefreshServerToApplyStaticAssets: false);
+        // Diagnostic delivery only needs the clients. No application process is launched.
+        var runningProject = new RunningProject(null!, null!, clients, NullLogger.Instance, null!, null!, []);
+        var builder = new ProjectUpdatesBuilder
+        {
+            Logger = NullLogger.Instance,
+            HotReloadService = null!,
+            FSharpHotReloadService = null!,
+            ManagedCodeSnapshot = default,
+            RunningProjects = ImmutableDictionary<string, ImmutableArray<RunningProject>>.Empty.Add("App.fsproj", [runningProject]),
+        };
+        var message = compilationBlocked ? "FS0001: F# compile error" : "FSHRDL001: Restart required";
+        var result = new FSharpManagedUpdateResult(
+            compilationBlocked ? FSharpManagedUpdateStatus.Blocked : FSharpManagedUpdateStatus.RestartRequired,
+            [],
+            [new("App.fsproj", message), new("App.fsproj", null), new("App.fsproj", "")]);
+        var display = typeof(ProjectUpdatesBuilder).GetMethod("DisplayResultsAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        // Roslyn grants access to the watch assembly, but not this test assembly.
+        var updatesType = display.GetParameters()[0].ParameterType;
+        var runningInfos = EmptyCollection(display.GetParameters()[2].ParameterType);
+
+        await (ValueTask)display.Invoke(builder, [CreateRoslynUpdates(hasError: true), result, runningInfos, CancellationToken.None])!;
+
+        using (var payload = JsonDocument.Parse(browser.Messages.Single()))
+        {
+            Assert.AreEqual("ReportDiagnostics", payload.RootElement.GetProperty("type").GetString());
+            var expected = compilationBlocked ? message : $"{message} Learn more: {FSharpHotReloadService.RudeEditHelpLink}";
+            Assert.AreSequenceEqual(
+                ["error CS1002: C# compile error", $"[App] {expected}"],
+                payload.RootElement.GetProperty("diagnostics").EnumerateArray().Select(value => value.GetString()));
+        }
+
+        await (ValueTask)display.Invoke(builder, [CreateRoslynUpdates(hasError: false), new FSharpManagedUpdateResult(FSharpManagedUpdateStatus.NoChanges, [], []), runningInfos, CancellationToken.None])!;
+
+        using var cleared = JsonDocument.Parse(browser.Messages.Last());
+        Assert.HasCount(2, browser.Messages);
+        Assert.AreEqual(0, cleared.RootElement.GetProperty("diagnostics").GetArrayLength());
+
+        object CreateRoslynUpdates(bool hasError)
+        {
+            var updates = Activator.CreateInstance(updatesType)!;
+            foreach (var property in updatesType.GetProperties())
+            {
+                property.SetValue(updates, property.Name == "Status"
+                    ? Enum.Parse(property.PropertyType, hasError ? "Blocked" : "NoChangesToApply")
+                    : EmptyCollection(property.PropertyType));
+            }
+
+            if (hasError)
+            {
+                updatesType.GetProperty("PersistentDiagnostics")!.SetValue(updates, ImmutableArray.Create(
+                    Diagnostic.Create(new DiagnosticDescriptor("CS1002", "Syntax error", "C# compile error", "Compiler", DiagnosticSeverity.Error, true), Location.None)));
+            }
+
+            return updates;
+        }
+
+        static object EmptyCollection(Type type)
+            => (type.GetField("Empty")?.GetValue(null) ?? type.GetProperty("Empty")?.GetValue(null))!;
+    }
+
+    /// <summary>Records the existing browser transport payload without a network listener.</summary>
+    private sealed class DiagnosticBrowserRefreshServer() : BrowserRefreshServer(
+        NullLogger.Instance, _ => NullLogger.Instance, _ => NullLogger.Instance, () => null,
+        middlewareAssemblyPath: "", useGatewayProxy: false, suppressTimeouts: true)
+    {
+        public List<string> Messages { get; } = [];
+
+        internal override ValueTask<TResult?> SendAndReceiveAsync<TRequest, TResult>(
+            IReadOnlyCollection<BrowserConnection> openConnections,
+            Func<string?, TRequest>? request,
+            ResponseFunc<TResult>? response,
+            CancellationToken cancellationToken)
+            where TResult : struct
+        {
+            var value = request!(null);
+            var bytes = value is ReadOnlyMemory<byte> message ? message : SerializeJson(value);
+            Messages.Add(System.Text.Encoding.UTF8.GetString(bytes.Span));
+            return ValueTask.FromResult<TResult?>(null);
+        }
+    }
+
+    [TestMethod]
     public void RudeEditHelpLink_PointsToFSharpDiagnosticReference()
     {
         var field = typeof(FSharpHotReloadService).GetField(
@@ -19,7 +109,7 @@ public class FSharpHotReloadServiceTests
             BindingFlags.Static | BindingFlags.NonPublic)!;
 
         Assert.AreEqual(
-            "https://github.com/dotnet/fsharp/blob/main/docs/hot-reload-rude-edits.md",
+            "https://github.com/NatElkins/fsharp/blob/413be4377c3dd88abe08c2bbb6e9f4b285a06a1e/docs/hot-reload-rude-edits.md",
             field.GetRawConstantValue());
     }
 

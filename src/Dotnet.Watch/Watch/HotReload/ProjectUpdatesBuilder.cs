@@ -42,6 +42,7 @@ internal sealed partial class ProjectUpdatesBuilder
 
     private async ValueTask DisplayResultsAsync(
         HotReloadService.Updates updates,
+        FSharpManagedUpdateResult fsharpResult,
         ImmutableDictionary<ProjectId, HotReloadService.RunningProjectInfo> runningProjectInfos,
         CancellationToken cancellationToken)
     {
@@ -73,6 +74,21 @@ internal sealed partial class ProjectUpdatesBuilder
         ReportCompilationDiagnostics(DiagnosticSeverity.Error);
         ReportCompilationDiagnostics(DiagnosticSeverity.Warning);
         ReportRudeEdits();
+
+        // The F# service reports console messages. Include its issues in the same browser update as Roslyn.
+        foreach (var issue in fsharpResult.Issues)
+        {
+            if (!string.IsNullOrEmpty(issue.Message))
+            {
+                var message = $"[{Path.GetFileNameWithoutExtension(issue.ProjectPath)}] {issue.Message}";
+                if (issue.Message.Contains("FSHRDL", StringComparison.Ordinal))
+                {
+                    message += $" Learn more: {FSharpHotReloadService.RudeEditHelpLink}";
+                }
+
+                errorsToDisplayInApp.Add(message);
+            }
+        }
 
         // report or clear diagnostics in the browser UI
         await RunningProjects.ForEachValueAsync(
@@ -244,7 +260,7 @@ internal sealed partial class ProjectUpdatesBuilder
         try
         {
             fsharpResult = await FSharpHotReloadService.TryEmitUpdatesAsync(changedFiles, RunningProjects, cancellationToken);
-            await DisplayResultsAsync(updates, runningProjectInfos, cancellationToken);
+            await DisplayResultsAsync(updates, fsharpResult, runningProjectInfos, cancellationToken);
 
             if (updates.Status == HotReloadService.Status.Blocked || fsharpResult.Status == FSharpManagedUpdateStatus.Blocked)
             {
