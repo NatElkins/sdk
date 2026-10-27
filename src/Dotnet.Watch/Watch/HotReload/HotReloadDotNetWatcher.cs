@@ -1259,6 +1259,7 @@ internal sealed class HotReloadDotNetWatcher
         };
 
         arguments.AddRange(_context.BuildArguments);
+        arguments.Add($"-p:{FSharpHotReloadService.WatchBuildPropertyName}=true");
 
         if (action != BuildAction.RestoreOnly && targetFramework != null)
         {

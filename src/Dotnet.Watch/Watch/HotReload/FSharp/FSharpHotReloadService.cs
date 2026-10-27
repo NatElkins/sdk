@@ -34,6 +34,9 @@ internal readonly record struct FSharpManagedUpdateResult(
 
 internal sealed class FSharpHotReloadService
 {
+    /// <summary>Preserves the F# opt-in property after upstream removed its watch-wide use.</summary>
+    internal const string WatchBuildPropertyName = "DotNetWatchBuild";
+
     private const string RudeEditHelpLink = "https://github.com/dotnet/fsharp/blob/main/docs/hot-reload-rude-edits.md";
 
     private readonly ILogger _logger;
@@ -1391,7 +1394,7 @@ internal sealed class FSharpHotReloadService
             startInfo.ArgumentList.Add("-p:NuGetInteractive=true");
             // The initial watch build and every forced compile must use identical F# lowering;
             // Microsoft.NET.Sdk.FSharp.targets adds the hot reload compiler flag for this build.
-            startInfo.ArgumentList.Add($"-p:{PropertyNames.DotNetWatchBuild}=true");
+            startInfo.ArgumentList.Add($"-p:{WatchBuildPropertyName}=true");
 
             using var process = Process.Start(startInfo);
             if (process == null)

@@ -4,6 +4,7 @@
 using System.Collections.Immutable;
 using System.IO;
 using Microsoft.Build.Graph;
+using Microsoft.DotNet.HotReload;
 using Microsoft.Extensions.Logging;
 using BuildLogger = Microsoft.Build.Framework.ILogger;
 
