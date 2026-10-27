@@ -8,7 +8,7 @@ using Microsoft.DotNet.Cli.Commands.MSBuild;
 using Microsoft.DotNet.Cli.Commands.NuGet;
 using Microsoft.DotNet.Cli.Commands.Run;
 using Microsoft.DotNet.Cli.Utils;
-using Microsoft.DotNet.ProjectTools;
+using Microsoft.DotNet.FileBasedPrograms;
 
 namespace Microsoft.DotNet.Cli.Commands.Package.Add;
 
@@ -91,7 +91,8 @@ internal sealed class PackageAddCommand : CommandBase<PackageAddCommandDefinitio
                         { "RestoreDotnetCliToolReferences", "false" },
                     }.AsReadOnly())
                     .CloneWithVerbosity(VerbosityOptions.quiet)
-                    .CloneWithAdditionalTargets("GenerateRestoreGraphFile"))
+                    .CloneWithAdditionalTargets("GenerateRestoreGraphFile"),
+                services: CommandServices.CreateDefault())
             {
                 NoRestore = true,
                 NoCache = true,
@@ -122,7 +123,9 @@ internal sealed class PackageAddCommand : CommandBase<PackageAddCommandDefinitio
 
                     // Set verbosity to quiet to avoid cluttering the output for this 'inner' build
                     "-v:quiet"
-                ]).Execute();
+                ],
+                msbuildPath: null,
+                services: CommandServices.CreateDefault()).Execute();
         }
 
         if (result != 0)

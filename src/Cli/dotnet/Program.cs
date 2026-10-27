@@ -124,7 +124,7 @@ public class Program
         finally
         {
             TelemetryInstance.TrackEvent("command/finish", new Dictionary<string, string?> { { "exitCode", exitCode.ToString() } });
-            Shutdown(default!);
+            Shutdown(null);
             TelemetryClient.WriteLogIfNecessary();
         }
     }
@@ -199,28 +199,28 @@ public class Program
     {
         // If we didn't match any built-in commands, and a C# file path is the first argument,
         // parse as `dotnet run file.cs ..rest_of_args` instead.
-        if (parseResult.GetFileBasedAppEntryPointToken() is { } unmatchedCommandOrFile)
+        if (parseResult.TryParseFileBasedAppAsRun() is { } runParseResult)
         {
-            List<string> otherTokens = new(parseResult.Tokens.Count - 1);
-            foreach (var token in parseResult.Tokens)
-            {
-                if (token.Type != TokenType.Argument || token != unmatchedCommandOrFile)
-                {
-                    otherTokens.Add(token.Value);
-                }
-            }
-            parseResult = Parser.Parse(["run", "--file", unmatchedCommandOrFile.Value, .. otherTokens]);
-            return CommandInvocation.ExecuteInternalCommand(parseResult);
+            return CommandInvocation.ExecuteInternalCommand(runParseResult);
         }
 
         return null;
     }
 
-    public static void Shutdown(PosixSignalContext context)
+    public static void Shutdown(PosixSignalContext? context)
     {
+        s_mainActivity?.SetEndTime(DateTime.UtcNow);
         s_sigIntRegistration.Dispose();
         s_sigQuitRegistration.Dispose();
         s_sigTermRegistration.Dispose();
+        if (TelemetryInstance is TelemetryClient telemetryClient)
+        {
+            telemetryClient.WaitForPendingEvents();
+        }
+        if (context is null)
+        {
+            TelemetryClient.WaitForInternalMicrosoftDetection();
+        }
         s_mainActivity?.Stop();
         TelemetryClient.FlushProviders();
         Activities.Source.Dispose();

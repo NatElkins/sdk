@@ -3,6 +3,7 @@
 
 using System.Collections.Frozen;
 using System.Diagnostics;
+using Microsoft.DotNet.Cli.InternalMicrosoft;
 using Microsoft.DotNet.Cli.Utils;
 using Microsoft.DotNet.Configurer;
 
@@ -27,6 +28,8 @@ public class TelemetryClient : ITelemetryClient
     private static readonly TracerProviderBuilder s_tracerProviderBuilder;
     private static TracerProvider? s_tracerProvider;
     private static readonly List<Activity> s_activities = [];
+    private static readonly InternalMicrosoftTelemetry s_internalMicrosoftTelemetry = new();
+    private static int s_providerShutdownRegistered;
 
 #if MICROSOFT_ENABLE_TELEMETRY_AZURE_MONITOR
     private static readonly string s_connectionString = "InstrumentationKey=74cc1c9e-3e6e-4d05-b3fc-dde9101d0254;IngestionEndpoint=https://southcentralus-0.in.applicationinsights.azure.com/;LiveEndpoint=https://southcentralus.livediagnostics.monitor.azure.com/;ApplicationId=c5108c2c-b0c5-43c6-a703-424eae223a75";
@@ -82,6 +85,8 @@ public class TelemetryClient : ITelemetryClient
     }
 
     public static string? CurrentSessionId { get; private set; } = null;
+    internal static bool IsInitialized { get; private set; }
+    internal static TelemetryClient? Instance { get; private set; }
     public static bool DisabledForTests
     {
         get => field;
@@ -92,6 +97,8 @@ public class TelemetryClient : ITelemetryClient
             if (field)
             {
                 CurrentSessionId = null;
+                IsInitialized = false;
+                Instance = null;
             }
         }
     } = false;
@@ -105,6 +112,7 @@ public class TelemetryClient : ITelemetryClient
         s_metricsProviderBuilder = Sdk.CreateMeterProviderBuilder()
             .ConfigureResource(r => { r.AddService("dotnet-cli", serviceVersion: Product.Version); })
             .AddMeter(Activities.Source.Name)
+            .AddMeter(Activities.PerformanceSource.Name)
             .AddRuntimeInstrumentation();
 
         if (s_enableOtlpExporter)
@@ -115,6 +123,8 @@ public class TelemetryClient : ITelemetryClient
         s_tracerProviderBuilder = Sdk.CreateTracerProviderBuilder()
             .ConfigureResource(r => { r.AddService("dotnet-cli", serviceVersion: Product.Version); })
             .AddSource(Activities.Source.Name)
+            .AddSource(Activities.PerformanceSource.Name)
+            .AddProcessor(new InternalMicrosoftTelemetryProcessor(s_internalMicrosoftTelemetry))
             .SetSampler(new AlwaysOnSampler());
 
         if (s_enableOtlpExporter)
@@ -173,6 +183,9 @@ public class TelemetryClient : ITelemetryClient
             return;
         }
 
+        Instance = this;
+        IsInitialized = true;
+
         environmentProvider ??= new EnvironmentProvider();
         Enabled = !environmentProvider.GetEnvironmentVariableAsBool(EnvironmentVariableNames.TELEMETRY_OPTOUT,
             // When building in the official CI pipeline, this makes the complier enable telemetry by default. Otherwise, it is disabled.
@@ -191,7 +204,17 @@ public class TelemetryClient : ITelemetryClient
             s_tracerProvider ??= s_tracerProviderBuilder.Build();
         }
 
-        CurrentSessionId ??= !string.IsNullOrEmpty(sessionId) ? sessionId : Guid.NewGuid().ToString();
+        s_internalMicrosoftTelemetry.Start(InternalMicrosoftDetector.CreateDefault(
+            Path.Join(CliFolderPathCalculator.DotnetUserProfileFolderPath, "internal-microsoft", "detector.json"),
+            s_isCIEnvironment,
+            Product.Version),
+            CancellationToken.None);
+
+        var initialSessionId = !string.IsNullOrEmpty(sessionId)
+            ? sessionId
+            : environmentProvider.GetEnvironmentVariable(EnvironmentVariableNames.DOTNET_CLI_TELEMETRY_SESSIONID);
+
+        CurrentSessionId ??= !string.IsNullOrEmpty(initialSessionId) ? initialSessionId : Guid.NewGuid().ToString();
         s_commonProperties = new TelemetryCommonProperties().GetTelemetryCommonProperties(CurrentSessionId);
     }
 
@@ -200,7 +223,7 @@ public class TelemetryClient : ITelemetryClient
     /// bridge via <c>hostfxr_set_runtime_property_value</c>), then falls back to the
     /// <c>TRACEPARENT</c> / <c>TRACESTATE</c> environment variables.
     /// </summary>
-    private static ActivityContext? GetParentActivityContext()
+    internal static ActivityContext? GetParentActivityContext()
     {
         // Runtime properties take precedence — they are set by the AOT bridge when it
         // falls back to the managed CLI so that the managed spans become children of the
@@ -247,11 +270,12 @@ public class TelemetryClient : ITelemetryClient
 
     public static void FlushProviders()
     {
-        if (s_isCIEnvironment)
+        if (s_isCIEnvironment || s_enableOtlpExporter)
         {
             // Shutdown drains the full export pipeline (BatchExportProcessor → Exporter.OnShutdown)
             // and waits for inflight HTTP POSTs to complete, bounded by the configured timeout.
-            // This is necessary in CI because there is no subsequent invocation to drain.
+            // This is necessary in CI because there is no subsequent invocation to drain, and
+            // for OTLP because the exporter does not use the local persistent-storage pipeline.
             s_tracerProvider?.Shutdown(s_shutdownTimeoutMs);
             s_metricsProvider?.Shutdown(s_shutdownTimeoutMs);
         }
@@ -265,11 +289,47 @@ public class TelemetryClient : ITelemetryClient
         }
     }
 
+    internal static void ForceFlushProviders()
+    {
+        int timeout = s_isCIEnvironment || s_enableOtlpExporter ? s_shutdownTimeoutMs : 10;
+        s_tracerProvider?.ForceFlush(timeout);
+        s_metricsProvider?.ForceFlush(timeout);
+    }
+
+    internal static void RegisterProviderShutdownOnProcessExit()
+    {
+        if (Interlocked.Exchange(ref s_providerShutdownRegistered, 1) != 0)
+        {
+            return;
+        }
+
+        AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+        {
+            try
+            {
+                FlushProviders();
+            }
+            catch
+            {
+                // Telemetry failures must not interfere with process shutdown.
+            }
+        };
+    }
+
     public static void WriteLogIfNecessary()
     {
-        if (!string.IsNullOrWhiteSpace(s_diskLogPath) && s_activities.Any())
+        if (string.IsNullOrWhiteSpace(s_diskLogPath))
         {
-            TelemetryDiskLogger.WriteLog(s_diskLogPath, s_activities);
+            return;
+        }
+
+        Activity[] activities = [.. s_activities];
+        if (activities.Length > 0 && TelemetryDiskLogger.WriteLog(s_diskLogPath, activities))
+        {
+            foreach (Activity activity in activities)
+            {
+                s_activities.Remove(activity);
+            }
         }
     }
 
@@ -295,6 +355,14 @@ public class TelemetryClient : ITelemetryClient
 
         TrackEventTask(eventName, properties);
     }
+
+    internal void WaitForPendingEvents()
+    {
+        _trackEventTask?.GetAwaiter().GetResult();
+    }
+
+    internal static void WaitForInternalMicrosoftDetection() =>
+        s_internalMicrosoftTelemetry.WaitForCompletion();
 
     private static void TrackEventTask(string eventName, IDictionary<string, string?>? properties)
     {

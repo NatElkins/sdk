@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Diagnostics;
+using System.Globalization;
 using Microsoft.DotNet.Cli;
 using Microsoft.DotNet.Cli.Telemetry;
 using Microsoft.DotNet.Cli.Utils;
@@ -15,6 +16,11 @@ namespace Microsoft.DotNet.Cli.Tests;
 ///  "managed fallback not found" error because test env doesn't have dotnet.dll in sdkDir.
 /// </summary>
 [TestClass]
+[ResourceLock(nameof(NativeEntryPoint))]
+[ResourceLock(nameof(Reporter))]
+[ResourceLock(nameof(SdkDirectoryScope))]
+[ResourceLock(WellKnownResources.Console)]
+[ResourceLock(WellKnownResources.EnvironmentVariables)]
 public partial class NativeEntryPointTests
 {
     /// <summary>
@@ -29,7 +35,18 @@ public partial class NativeEntryPointTests
         string? originalTraceParent = Environment.GetEnvironmentVariable(Activities.TRACEPARENT);
         string? originalTraceState = Environment.GetEnvironmentVariable(Activities.TRACESTATE);
         string? originalTelemetryOptout = Environment.GetEnvironmentVariable("DOTNET_CLI_TELEMETRY_OPTOUT");
+        string? originalUiLanguage = Environment.GetEnvironmentVariable("DOTNET_CLI_UI_LANGUAGE");
+        string? originalVsLanguage = Environment.GetEnvironmentVariable("VSLANG");
+        string? originalPreferredUiLanguage = Environment.GetEnvironmentVariable("PreferredUILang");
+        string? originalDotnetHome = Environment.GetEnvironmentVariable("DOTNET_CLI_HOME");
+        string? originalGenerateCertificate = Environment.GetEnvironmentVariable("DOTNET_GENERATE_ASPNET_CERTIFICATE");
+        string? originalAddGlobalToolsToPath = Environment.GetEnvironmentVariable("DOTNET_ADD_GLOBAL_TOOLS_TO_PATH");
+        string? originalSkipWorkloadIntegrityCheck = Environment.GetEnvironmentVariable("DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK");
+        string? originalNoLogo = Environment.GetEnvironmentVariable("DOTNET_NOLOGO");
+        CultureInfo? originalDefaultThreadCurrentUiCulture = CultureInfo.DefaultThreadCurrentUICulture;
         object? originalSdkRoot = AppContext.GetData(SdkPaths.DataName);
+        string? originalDotnetRoot = NativeEntryPoint.DotnetRoot;
+        string? originalSdkDirectory = NativeEntryPoint.SdkDirectory;
         try
         {
             action();
@@ -41,7 +58,19 @@ public partial class NativeEntryPointTests
             Environment.SetEnvironmentVariable(Activities.TRACEPARENT, originalTraceParent);
             Environment.SetEnvironmentVariable(Activities.TRACESTATE, originalTraceState);
             Environment.SetEnvironmentVariable("DOTNET_CLI_TELEMETRY_OPTOUT", originalTelemetryOptout);
+            Environment.SetEnvironmentVariable("DOTNET_CLI_UI_LANGUAGE", originalUiLanguage);
+            Environment.SetEnvironmentVariable("VSLANG", originalVsLanguage);
+            Environment.SetEnvironmentVariable("PreferredUILang", originalPreferredUiLanguage);
+            Environment.SetEnvironmentVariable("DOTNET_CLI_HOME", originalDotnetHome);
+            Environment.SetEnvironmentVariable("DOTNET_GENERATE_ASPNET_CERTIFICATE", originalGenerateCertificate);
+            Environment.SetEnvironmentVariable("DOTNET_ADD_GLOBAL_TOOLS_TO_PATH", originalAddGlobalToolsToPath);
+            Environment.SetEnvironmentVariable("DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK", originalSkipWorkloadIntegrityCheck);
+            Environment.SetEnvironmentVariable("DOTNET_NOLOGO", originalNoLogo);
+            CultureInfo.DefaultThreadCurrentUICulture = originalDefaultThreadCurrentUiCulture;
             AppContext.SetData(SdkPaths.DataName, originalSdkRoot);
+            NativeEntryPoint.DotnetRoot = originalDotnetRoot;
+            NativeEntryPoint.SdkDirectory = originalSdkDirectory;
+            SdkPaths.ClearSdkDirectoryCacheForTests();
         }
     }
 
@@ -378,16 +407,16 @@ public partial class NativeEntryPointTests
         });
     }
 
+    /// <summary>Verifies that a build-enabled shorthand file invocation falls back to the managed CLI.</summary>
     [TestMethod]
-    public void ExecuteCore_AotEnabled_FileBasedApp_FallsBackToManaged()
+    public void ExecuteCore_AotEnabled_BuildEnabledFileBasedApp_FallsBackToManaged()
     {
         WithEnvRestore(() =>
         {
             Environment.SetEnvironmentVariable("DOTNET_CLI_ENABLEAOT", "true");
 
-            // `dotnet app.cs` must not be served by the AOT path (which would print root usage);
-            // it has to fall back to the managed CLI's run pipeline. With a nonexistent SDK dir the
-            // fallback can't be hosted, so it reports the missing dotnet.dll - proving we reached it.
+            // Build-enabled `dotnet app.cs` remains outside the launch-only AOT contract and falls
+            // back to the managed run pipeline. The nonexistent SDK proves fallback was reached.
             var csFile = Path.Combine(Path.GetTempPath(), $"aot-entry-filebased-{Guid.NewGuid():N}.cs");
             File.WriteAllText(csFile, "Console.WriteLine(\"hi\");");
 
@@ -400,7 +429,7 @@ public partial class NativeEntryPointTests
                 int exitCode = NativeEntryPoint.ExecuteCore(
                     hostPath: "test-host",
                     dotnetRoot: "test-root",
-                    sdkDir: "nonexistent-sdk-dir",
+                    sdkDir: "",
                     hostfxrPath: "",
                     args: [csFile]);
 
@@ -411,6 +440,98 @@ public partial class NativeEntryPointTests
             {
                 Console.SetError(originalErr);
                 File.Delete(csFile);
+            }
+        });
+    }
+
+    /// <summary>Verifies that external command resolution takes precedence over shorthand file execution.</summary>
+    [TestMethod]
+    public void ExecuteCore_AotEnabled_ExternalCommandTakesPrecedenceOverFileBasedApp()
+    {
+        WithEnvRestore(() =>
+        {
+            Environment.SetEnvironmentVariable("DOTNET_CLI_ENABLEAOT", "true");
+            string commandToken = $"aot-precedence-{Guid.NewGuid():N}.cs";
+            string sourcePath = Path.Combine(Environment.CurrentDirectory, commandToken);
+            string toolDirectory = Path.Combine(Path.GetTempPath(), $"aot-precedence-tool-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(toolDirectory);
+            File.WriteAllText(sourcePath, "Console.WriteLine(42);");
+            string originalPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+
+            try
+            {
+                const int expectedExitCode = 42;
+                if (OperatingSystem.IsWindows())
+                {
+                    File.WriteAllText(
+                        Path.Combine(toolDirectory, $"dotnet-{commandToken}.cmd"),
+                        $"@echo off{Environment.NewLine}exit /b {expectedExitCode}{Environment.NewLine}");
+                }
+                else
+                {
+                    string toolPath = Path.Combine(toolDirectory, $"dotnet-{commandToken}");
+                    File.WriteAllText(toolPath, $"#!/bin/sh{Environment.NewLine}exit {expectedExitCode}{Environment.NewLine}");
+                    File.SetUnixFileMode(toolPath,
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                        UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                        UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+                }
+
+                Environment.SetEnvironmentVariable("PATH", toolDirectory + Path.PathSeparator + originalPath);
+                int exitCode = NativeEntryPoint.ExecuteCore(
+                    hostPath: "test-host",
+                    dotnetRoot: "test-root",
+                    sdkDir: "",
+                    hostfxrPath: "",
+                    args: [commandToken, "--no-build", "--no-launch-profile"]);
+
+                Assert.AreEqual(expectedExitCode, exitCode);
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("PATH", originalPath);
+                File.Delete(sourcePath);
+                Directory.Delete(toolDirectory, recursive: true);
+            }
+        });
+    }
+
+    /// <summary>Verifies that a committed shorthand Executable profile launch failure is terminal.</summary>
+    [TestMethod]
+    public void ExecuteCore_AotEnabled_ShorthandExecutableProfileFailureIsTerminal()
+    {
+        WithEnvRestore(() =>
+        {
+            Environment.SetEnvironmentVariable("DOTNET_CLI_ENABLEAOT", "true");
+            string testDirectory = Path.Combine(Path.GetTempPath(), $"aot-profile-failure-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(testDirectory);
+            string sourcePath = Path.Combine(testDirectory, "Program.cs");
+            File.WriteAllText(sourcePath, "Console.WriteLine(42);");
+            File.WriteAllText(Path.Combine(testDirectory, "Program.run.json"), """
+                {
+                  "profiles": {
+                    "MissingExecutable": {
+                      "commandName": "Executable",
+                      "executablePath": "aot-profile-command-that-does-not-exist"
+                    }
+                  }
+                }
+                """);
+
+            try
+            {
+                int exitCode = NativeEntryPoint.ExecuteCore(
+                    hostPath: "test-host",
+                    dotnetRoot: "test-root",
+                    sdkDir: "",
+                    hostfxrPath: "",
+                    args: [sourcePath, "--no-build", "--launch-profile", "MissingExecutable"]);
+
+                Assert.AreEqual(1, exitCode);
+            }
+            finally
+            {
+                Directory.Delete(testDirectory, recursive: true);
             }
         });
     }
@@ -498,6 +619,70 @@ public partial class NativeEntryPointTests
             {
                 Environment.SetEnvironmentVariable("PATH", originalPath);
                 try { Directory.Delete(toolDir, recursive: true); } catch { }
+            }
+        });
+    }
+
+    [TestMethod]
+    [DataRow("de-DE", "Willkommen bei .NET")]
+    [DataRow("zh-Hans", "欢迎使用 .NET")]
+    public void ExecuteCore_AotEnabled_LocalizedFirstRun_StaysOnAotPath(string uiLanguage, string expectedWelcome)
+    {
+        WithEnvRestore(() =>
+        {
+            const int expectedExitCode = 42;
+            string testDirectory = Path.Combine(Path.GetTempPath(), $"aot-localized-first-run-{Guid.NewGuid():N}");
+            string toolDirectory = Path.Combine(testDirectory, "tools");
+            string originalPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+            var bufferedError = new BufferedReporter();
+            Directory.CreateDirectory(toolDirectory);
+
+            try
+            {
+                Environment.SetEnvironmentVariable("DOTNET_CLI_ENABLEAOT", "true");
+                Environment.SetEnvironmentVariable("DOTNET_CLI_UI_LANGUAGE", uiLanguage);
+                Environment.SetEnvironmentVariable("DOTNET_CLI_HOME", testDirectory);
+                Environment.SetEnvironmentVariable("DOTNET_CLI_TELEMETRY_OPTOUT", "true");
+                Environment.SetEnvironmentVariable("DOTNET_GENERATE_ASPNET_CERTIFICATE", "false");
+                Environment.SetEnvironmentVariable("DOTNET_ADD_GLOBAL_TOOLS_TO_PATH", "false");
+                Environment.SetEnvironmentVariable("DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK", "true");
+                Environment.SetEnvironmentVariable("DOTNET_NOLOGO", "false");
+                Reporter.SetError(bufferedError);
+
+                if (OperatingSystem.IsWindows())
+                {
+                    File.WriteAllText(
+                        Path.Combine(toolDirectory, "dotnet-aotlocalized.cmd"),
+                        $"@echo off{Environment.NewLine}exit /b {expectedExitCode}{Environment.NewLine}");
+                }
+                else
+                {
+                    string toolPath = Path.Combine(toolDirectory, "dotnet-aotlocalized");
+                    File.WriteAllText(toolPath, $"#!/bin/sh{Environment.NewLine}exit {expectedExitCode}{Environment.NewLine}");
+                    File.SetUnixFileMode(toolPath,
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                        UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                        UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+                }
+
+                Environment.SetEnvironmentVariable("PATH", toolDirectory + Path.PathSeparator + originalPath);
+                string sdkDirectory = SdkRootLocator.TrySelfLocateSdkDirectory() ?? AppContext.BaseDirectory;
+
+                int exitCode = NativeEntryPoint.ExecuteCore(
+                    hostPath: "test-host",
+                    dotnetRoot: "test-root",
+                    sdkDir: sdkDirectory,
+                    hostfxrPath: "",
+                    args: ["aotlocalized"]);
+
+                Assert.AreEqual(expectedExitCode, exitCode);
+                string.Join(Environment.NewLine, bufferedError.Lines).Should().Contain(expectedWelcome);
+            }
+            finally
+            {
+                Reporter.Reset();
+                Environment.SetEnvironmentVariable("PATH", originalPath);
+                Directory.Delete(testDirectory, recursive: true);
             }
         });
     }

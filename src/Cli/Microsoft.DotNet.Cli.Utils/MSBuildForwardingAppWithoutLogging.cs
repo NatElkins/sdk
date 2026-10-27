@@ -182,6 +182,8 @@ internal sealed class MSBuildForwardingAppWithoutLogging
     /// </summary>
     public int Execute()
     {
+        using var activity = Activities.PerformanceSource.StartActivity("msbuild-submission");
+
         if (_forwardingApp != null)
         {
             return GetProcessStartInfo().Execute();
@@ -207,35 +209,76 @@ internal sealed class MSBuildForwardingAppWithoutLogging
     [RequiresDynamicCode("Calls MSBuildApp.Main, which is not AOT-safe")]
     public int ExecuteInProc(string[] arguments)
     {
-        // Save current environment variables before overwriting them.
+        using var _ = SetEnvironmentVariables(_msbuildRequiredEnvironmentVariables);
+        try
+        {
+            // Execute MSBuild in the current process by calling its Main method.
+            return Build.CommandLine.MSBuildApp.Main(arguments);
+        }
+        catch (Exception exception)
+        {
+            // MSBuild, like all well-behaved CLI tools, handles all exceptions. In the unlikely case
+            // that something still escapes, we print the exception and fail the call. Non-localized
+            // string is OK here.
+            Console.Error.Write("Unhandled exception: ");
+            Console.Error.WriteLine(exception.ToString());
+
+            return unchecked((int)0xe0434352); // EXCEPTION_COMPLUS
+        }
+    }
+
+    /// <summary>
+    /// Sets the required MSBuild environment variables for a direct in-process MSBuild operation.
+    /// Restores their original values when disposed.
+    /// </summary>
+    internal static IDisposable SetMSBuildRequiredEnvironmentVariables()
+        => SetEnvironmentVariables(GetMSBuildRequiredEnvironmentVariables());
+
+    /// <summary>
+    /// Sets the required MSBuild environment variables and additional variables for a direct
+    /// in-process MSBuild operation. Restores their original values when disposed.
+    /// </summary>
+    internal static IDisposable SetMSBuildRequiredEnvironmentVariables(
+        IEnumerable<KeyValuePair<string, string?>> additionalEnvironmentVariables)
+    {
+        Dictionary<string, string?> environmentVariables = GetMSBuildRequiredEnvironmentVariables();
+        foreach (KeyValuePair<string, string?> variable in additionalEnvironmentVariables)
+        {
+            environmentVariables[variable.Key] = variable.Value;
+        }
+
+        return SetEnvironmentVariables(environmentVariables);
+    }
+
+    private static IDisposable SetEnvironmentVariables(IEnumerable<KeyValuePair<string, string?>> environmentVariables)
+    {
         Dictionary<string, string?> savedEnvironmentVariables = [];
         try
         {
-            foreach (KeyValuePair<string, string?> kvp in _msbuildRequiredEnvironmentVariables)
+            foreach (KeyValuePair<string, string?> kvp in environmentVariables)
             {
                 savedEnvironmentVariables[kvp.Key] = Environment.GetEnvironmentVariable(kvp.Key);
                 Environment.SetEnvironmentVariable(kvp.Key, kvp.Value);
             }
-
-            try
-            {
-                // Execute MSBuild in the current process by calling its Main method.
-                return Build.CommandLine.MSBuildApp.Main(arguments);
-            }
-            catch (Exception exception)
-            {
-                // MSBuild, like all well-behaved CLI tools, handles all exceptions. In the unlikely case
-                // that something still escapes, we print the exception and fail the call. Non-localized
-                // string is OK here.
-                Console.Error.Write("Unhandled exception: ");
-                Console.Error.WriteLine(exception.ToString());
-
-                return unchecked((int)0xe0434352); // EXCEPTION_COMPLUS
-            }
         }
-        finally
+        catch
         {
-            // Restore saved environment variables.
+            EnvironmentVariableRestorer.Restore(savedEnvironmentVariables);
+            throw;
+        }
+
+        return new EnvironmentVariableRestorer(savedEnvironmentVariables);
+    }
+
+    private sealed class EnvironmentVariableRestorer(Dictionary<string, string?> savedEnvironmentVariables) : IDisposable
+    {
+        public void Dispose()
+        {
+            Restore(savedEnvironmentVariables);
+        }
+
+        internal static void Restore(Dictionary<string, string?> savedEnvironmentVariables)
+        {
             foreach (KeyValuePair<string, string?> kvp in savedEnvironmentVariables)
             {
                 Environment.SetEnvironmentVariable(kvp.Key, kvp.Value);
@@ -257,7 +300,7 @@ internal sealed class MSBuildForwardingAppWithoutLogging
     private static string GetMSBuildExePath()
     {
         return Path.Combine(
-            AppContext.BaseDirectory,
+            SdkPaths.SdkDirectory,
             MSBuildExeName);
     }
 
@@ -276,7 +319,7 @@ internal sealed class MSBuildForwardingAppWithoutLogging
         }
 
         return Path.Combine(
-            AppContext.BaseDirectory,
+            SdkPaths.SdkDirectory,
             SdksDirectoryName);
     }
 
@@ -295,7 +338,7 @@ internal sealed class MSBuildForwardingAppWithoutLogging
     {
         return new()
         {
-            { "MSBuildExtensionsPath", MSBuildExtensionsPathTestHook ?? Environment.GetEnvironmentVariable("MSBuildExtensionsPath") ?? AppContext.BaseDirectory },
+            { "MSBuildExtensionsPath", MSBuildExtensionsPathTestHook ?? Environment.GetEnvironmentVariable("MSBuildExtensionsPath") ?? SdkPaths.SdkDirectory },
             { "MSBuildSDKsPath", GetMSBuildSDKsPath() },
             { "DOTNET_HOST_PATH", GetDotnetPath() },
         };

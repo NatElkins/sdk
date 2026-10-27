@@ -1,8 +1,8 @@
 ﻿// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
-using System.Diagnostics.CodeAnalysis;
 using System.Runtime.Versioning;
+using Microsoft.DotNet;
 using Microsoft.DotNet.Cli.Commands.Workload;
 using Microsoft.DotNet.Cli.Installer.Windows.Security;
 
@@ -53,12 +53,12 @@ internal class MsiPackageCache(
     {
         // Validate that packageId and packageVersion do not contain path traversal characters
         // to prevent an IPC client from constructing paths outside the package cache.
-        if (!WindowsUtils.ValidatePathComponent(packageId))
+        if (!PathComponentUtilities.IsValidPathComponent(packageId))
         {
             throw new ArgumentException($"Invalid package ID: {packageId}");
         }
 
-        if (!WindowsUtils.ValidatePathComponent(packageVersion))
+        if (!PathComponentUtilities.IsValidPathComponent(packageVersion))
         {
             throw new ArgumentException($"Invalid package version: {packageVersion}");
         }
@@ -85,8 +85,13 @@ internal class MsiPackageCache(
         {
             string packageDirectory = GetPackageDirectory(packageId, packageVersion);
 
-            // Delete the package directory and create a new one that's secure. If all the files were properly
-            // cached, the client would not request this action.
+            if (TrustedMachinePath.IsUnderRoot(packageDirectory, TrustedMachinePath.ProgramDataDotnetRoot))
+            {
+                // Establish the ProgramData trust anchor before recursively deleting a partial cache entry.
+                SecurityUtils.EnsureSecureProgramDataRoot();
+            }
+
+            // If all the files were properly cached, the client would not request this action.
             if (Directory.Exists(packageDirectory))
             {
                 Directory.Delete(packageDirectory, recursive: true);
@@ -96,7 +101,7 @@ internal class MsiPackageCache(
 
             // We cannot assume that the MSI adjacent to the manifest is the one to cache. We'll trust
             // the manifest to provide the MSI filename.
-            MsiManifest? msiManifest = JsonSerializer.Deserialize(File.ReadAllText(fullManifestPath), InstallerJsonSerializerContext.Default.MsiManifest);
+            MsiManifest? msiManifest = JsonSerializer.Deserialize(File.ReadAllText(fullManifestPath), MsiManifestJsonSerializerContext.Default.MsiManifest);
             // Only use the filename+extension of the payload property in case the manifest has been altered.
             string msiPath = Path.Combine(Path.GetDirectoryName(fullManifestPath)!, Path.GetFileName(msiManifest?.Payload ?? string.Empty));
 
@@ -142,43 +147,15 @@ internal class MsiPackageCache(
         string packageCacheDirectory = GetPackageDirectory(packageId, packageVersion);
         payload = default;
 
-        if (!TryGetMsiPathFromPackageData(packageCacheDirectory, out string? msiPath, out string manifestPath))
+        if (!MsiPackageData.TryGetMsiPath(packageCacheDirectory, out string? msiPath, out string manifestPath, message => Log?.LogMessage(message)))
         {
             return false;
         }
 
-        VerifyPackageSignature(msiPath);
+        VerifyPackageSignature(msiPath!);
 
-        payload = new MsiPayload(manifestPath, msiPath);
+        payload = new MsiPayload(manifestPath, msiPath!);
 
-        return true;
-    }
-
-    public bool TryGetMsiPathFromPackageData(string packageDataPath, [NotNullWhen(true)] out string? msiPath, out string manifestPath)
-    {
-        msiPath = default;
-        manifestPath = Path.GetFullPath(Path.Combine(packageDataPath, "msi.json"));
-
-        // It's possible that the MSI is cached, but without the JSON manifest we cannot
-        // trust that the MSI in the cache directory is the correct file.
-        if (!File.Exists(manifestPath))
-        {
-            Log?.LogMessage($"MSI manifest file does not exist, '{manifestPath}'");
-            return false;
-        }
-
-        // The msi.json manifest contains the name of the actual MSI. The filename does not necessarily match the package
-        // ID as it may have been shortened to support VS caching.
-        MsiManifest? msiManifest = JsonSerializer.Deserialize(File.ReadAllText(manifestPath), InstallerJsonSerializerContext.Default.MsiManifest);
-        string possibleMsiPath = Path.Combine(Path.GetDirectoryName(manifestPath)!, msiManifest?.Payload ?? string.Empty);
-
-        if (!File.Exists(possibleMsiPath))
-        {
-            Log?.LogMessage($"MSI package not found, '{possibleMsiPath}'");
-            return false;
-        }
-
-        msiPath = possibleMsiPath;
         return true;
     }
 
@@ -198,7 +175,7 @@ internal class MsiPackageCache(
     /// this method logs a skip message and returns without checking.</para>
     /// </remarks>
     /// <param name="msiPath">The full path of the MSI to verify.</param>
-    private void VerifyPackageSignature(string msiPath)
+    internal void VerifyPackageSignature(string msiPath)
     {
         if (!VerifyMsiSignature)
         {

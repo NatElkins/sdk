@@ -2,7 +2,25 @@
 
 Guidance for changes under `src/Cli`.
 
-## Three-project split
+## SDK process entry points
+
+SDK-owned CLI code has three process entry points of equal importance:
+
+| Entry point | Source | Host and lifecycle |
+|-------------|--------|--------------------|
+| Managed CLI | `dotnet/Program.cs` | CoreCLR calls `Program.Main`. The process ends after the command completes. |
+| Native AOT CLI | `dotnet-aot/NativeEntryPoint.cs` | The native host calls the exported `dotnet_execute`. Unsupported operations can continue in the managed CLI. |
+| MSBuild logger | `dotnet/Commands/MSBuild/MSBuildLogger.cs` | MSBuild loads the SDK assembly as an `INodeLogger`. `MSBuildForwardingApp` adds the `-distributedlogger` argument. The logger can run in the CLI process, a child process, or a persistent server. |
+
+Treat the logger as an independent entry point. Do not assume that it runs after managed
+`Program.Main` or the Native AOT bootstrap. Initialize process-wide telemetry and tracing
+when MSBuild loads the logger directly. Start request-specific state at `BuildStarted`,
+record the result at `BuildFinished`, and keep the activity open until `Shutdown` because
+MSBuild emits final telemetry after `BuildFinished`. `Shutdown` completes one logger
+instance. It does not necessarily end the process. Refresh the environment and trace
+context for each persistent-server request.
+
+## Three-project command split
 
 A `dotnet` command or option spans three cooperating projects:
 
@@ -19,6 +37,11 @@ deps out of `Definitions`. In the managed CLI, code that isn't AOT-safe is exclu
 from the AOT build with `#if !CLI_AOT` (the AOT project links files from `dotnet` and
 compiles with `CLI_AOT` defined).
 
+`MSBuildRuntimeReference.targets` supplies the packaged MSBuild command-line assembly
+to `dotnet` and `Microsoft.DotNet.Cli.Utils`. Internal parser APIs are accessible to the
+signed `dotnet` assembly through MSBuild's `InternalsVisibleTo`; keep those calls
+managed-only rather than introducing MSBuild dependencies into `Definitions`.
+
 ## Where things live
 
 `src/Cli` is a set of projects, not one app. The three above carry commands; the
@@ -28,6 +51,7 @@ rest are supporting libraries:
 |---------|------|
 | `dotnet` | Primary managed executable — every command's handler lives here under `Commands/`. |
 | `Microsoft.DotNet.Cli.Definitions` | AOT-safe command tree (parsed by both hosts). |
+| `Microsoft.DotNet.Cli.InternalMicrosoft` | AOT-safe Microsoft-internal classification, probes, and cache. It does not emit telemetry. |
 | `dotnet-aot` + `dn` | NativeAOT shared library + native host exe. |
 | `Microsoft.DotNet.Cli.Utils` | MSBuild/NuGet/process/system abstractions used across the CLI. |
 | `Microsoft.DotNet.Cli.CoreUtils` | Low-level version/file/env-variable parsing. |
@@ -54,6 +78,21 @@ rest are supporting libraries:
 - `Common/` — shared option/argument factories.
 - `Help/` — help builder and localization.
 
+## Per-command services
+
+[`CommandServices`](dotnet/CommandServices.cs) holds immutable service dependencies.
+[`CommandBase`](dotnet/CommandBase.cs) retains them per instance. Build-family factories
+require callers to provide services explicitly; pass the same instance to subordinate commands, as
+[`RestoringCommand`](dotnet/Commands/Restore/RestoringCommand.cs) does for separate restore.
+CLI entry points that do not receive services create the production defaults explicitly.
+
+For in-process LLM tests, inject a detector through these services rather than changing
+the process environment or adding ambient overrides. Keep command-path tests entering
+through the real factory; see
+[`GivenCommandServices`](../../test/dotnet.Tests/CommandTests/MSBuild/GivenCommandServices.cs).
+Test the detector's environment-variable mapping separately with an `IEnvironmentProvider`.
+For subprocess tests, set environment variables on the child process instead.
+
 ## Verify (approval) snapshot tests
 
 Many CLI tests use Verify (`[UsesVerify]` / VerifyMSTest):
@@ -66,3 +105,14 @@ Many CLI tests use Verify (`[UsesVerify]` / VerifyMSTest):
   matching `*.verified.txt`.
 - Volatile lines (paths, timings, versions) are scrubbed via
   `settings.ScrubLinesContaining(...)` — scrub rather than hard-code them.
+
+## MTP process completion
+
+[`TestApplicationHandler`](dotnet/Commands/Test/MTP/TestApplicationHandler.cs) distinguishes
+TestHost completion from orchestrator-only completion. An exit-0 `RefreshMappingsOrchestrator`
+in collection mode or `RunAffectedTestsOrchestrator` in affected-run mode can finish without
+a TestHost; legacy collection can omit handshakes entirely. Missing/unknown capabilities,
+controller-only or mixed partial handshakes, and explicit handshake rejections must not
+gain that exemption. Rejection and partial-handshake state must survive later accepted
+handshakes. Keep these boundaries covered by
+[`TestApplicationHandlerTests`](../../test/dotnet.Tests/CommandTests/Test/TestApplicationHandlerTests.cs).

@@ -1,8 +1,10 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using Microsoft.DotNet.Cli.Commands;
 using Microsoft.DotNet.Cli.Commands.Test;
 using Microsoft.DotNet.Cli.Commands.Test.Terminal;
 using Moq;
@@ -13,6 +15,20 @@ namespace dotnet.Tests.CommandTests.Test;
 [TestClass]
 public class TerminalTestReporterTests
 {
+    [TestMethod]
+    public void AnsiTerminal_StopUpdate_WritesStringBuilder()
+    {
+        var console = new Mock<IConsole>(MockBehavior.Strict);
+        console.Setup(c => c.Write(It.IsAny<StringBuilder>()));
+        var terminal = new AnsiTerminal(console.Object, baseDirectory: null);
+
+        terminal.StartUpdate();
+        terminal.Append("batched output");
+        terminal.StopUpdate();
+
+        console.Verify(c => c.Write(It.Is<StringBuilder>(builder => builder.ToString() == "batched output")), Times.Once);
+    }
+
     /// <summary>
     /// Regression test for https://github.com/dotnet/sdk/issues/51608: if a test host process exits
     /// before the test session was ever started (so the execution id is never registered with the
@@ -184,6 +200,260 @@ public class TerminalTestReporterTests
         output.Should().NotContain("error:");
     }
 
+    [TestMethod]
+    public void TestExecutionCompleted_WithAllowedZeroTests_PrintsPassingAssemblyAndRunSummary()
+    {
+        var capturingConsole = new CapturingConsole();
+        var options = new TerminalTestReporterOptions
+        {
+            AllowZeroTests = true,
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+            ShowAssembly = true,
+            ShowAssemblyStartAndComplete = true,
+        };
+
+        using var reporter = new TerminalTestReporter(capturingConsole, options);
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 1, isDiscovery: false, isHelp: false, isRetry: false);
+
+        const string assembly = "/repo/bin/Debug/net9.0/Affected.Tests.dll";
+        reporter.AssemblyRunStarted(assembly, "net9.0", "x64", executionId: "exec-empty", instanceId: "inst-empty");
+        reporter.AssemblyRunCompleted(
+            executionId: "exec-empty",
+            exitCode: Microsoft.DotNet.Cli.Commands.Test.ExitCode.ZeroTests,
+            outputData: null,
+            errorData: null);
+        reporter.TestExecutionCompleted(DateTimeOffset.UtcNow, exitCode: Microsoft.DotNet.Cli.Commands.Test.ExitCode.Success);
+
+        string output = StripAnsi(capturingConsole.GetOutput());
+        output.Should().Contain("Test run summary: Passed!");
+        GetAssemblySummaryLine(output, assembly).Should().Contain("passed");
+        output.Should().NotContain("Zero tests ran");
+        output.Should().NotContain("Test run returned non-zero exit code");
+    }
+
+    [TestMethod]
+    [DataRow(TestExitCode.Success, "Passed!")]
+    [DataRow(TestExitCode.ZeroTests, "Zero tests ran")]
+    public void TestExecutionCompleted_WithAllSelectedTestsSkipped_MatchesFinalExitCode(
+        int exitCode,
+        string expectedSummary)
+    {
+        var capturingConsole = new CapturingConsole();
+        var options = new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+            ShowAssembly = true,
+            ShowAssemblyStartAndComplete = false,
+        };
+
+        using var reporter = new TerminalTestReporter(capturingConsole, options);
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 1, isDiscovery: false, isHelp: false, isRetry: false);
+
+        const string assembly = "/repo/bin/Debug/net9.0/Affected.Tests.dll";
+        reporter.AssemblyRunStarted(assembly, "net9.0", "x64", executionId: "exec-skipped", instanceId: "inst-skipped");
+        ReportTest(reporter, assembly, executionId: "exec-skipped", instanceId: "inst-skipped", testUid: "skipped-1", TestOutcome.Skipped);
+        reporter.AssemblyRunCompleted(
+            executionId: "exec-skipped",
+            exitCode: Microsoft.DotNet.Cli.Commands.Test.ExitCode.Success,
+            outputData: null,
+            errorData: null);
+        reporter.TestExecutionCompleted(DateTimeOffset.UtcNow, exitCode);
+
+        StripAnsi(capturingConsole.GetOutput()).Should().Contain($"Test run summary: {expectedSummary}");
+    }
+
+    [TestMethod]
+    public void TestExecutionCompleted_WithAllowedZeroTestsAndUnexpectedNonZeroExit_PrintsFailedSummary()
+    {
+        var capturingConsole = new CapturingConsole();
+        var options = new TerminalTestReporterOptions
+        {
+            AllowZeroTests = true,
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+        };
+
+        using var reporter = new TerminalTestReporter(capturingConsole, options);
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 1, isDiscovery: false, isHelp: false, isRetry: false);
+        reporter.TestExecutionCompleted(
+            DateTimeOffset.UtcNow,
+            exitCode: Microsoft.DotNet.Cli.Commands.Test.ExitCode.GenericFailure);
+
+        StripAnsi(capturingConsole.GetOutput()).Should().Contain("Test run summary: Failed!");
+    }
+
+    [TestMethod]
+    public void TestExecutionCompleted_WithForwardedMinimumExpectedTestsViolation_PrintsGenericFailure()
+    {
+        var capturingConsole = new CapturingConsole();
+        var options = new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+        };
+
+        using var reporter = new TerminalTestReporter(capturingConsole, options);
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 1, isDiscovery: false, isHelp: false, isRetry: false);
+        reporter.TestExecutionCompleted(
+            DateTimeOffset.UtcNow,
+            exitCode: Microsoft.DotNet.Cli.Commands.Test.ExitCode.MinimumExpectedTestsPolicyViolation);
+
+        string output = StripAnsi(capturingConsole.GetOutput());
+        output.Should().Contain("Test run summary: Failed!");
+        output.Should().NotContain("minimum expected 0");
+    }
+
+    [TestMethod]
+    [DataRow(false, "Test run completed with non-success exit code: 5. The command-line arguments are invalid.")]
+    [DataRow(true, "Test discovery completed with non-success exit code: 5. The command-line arguments are invalid.")]
+    public void TestExecutionCompleted_WithKnownExitCode_PrintsDescription(bool isDiscovery, string expected)
+    {
+        var capturingConsole = new CapturingConsole();
+        using var reporter = new TerminalTestReporter(capturingConsole, new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+        });
+
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 1, isDiscovery, isHelp: false, isRetry: false);
+        reporter.TestExecutionCompleted(DateTimeOffset.UtcNow, exitCode: TestExitCode.InvalidCommandLine);
+
+        StripAnsi(capturingConsole.GetOutput()).Should().Contain(expected);
+    }
+
+    [TestMethod]
+    public void TestExecutionCompleted_WithMixedOutcomes_ColorizesSkippedCount()
+    {
+        var capturingConsole = new CapturingConsole();
+        using var reporter = new TerminalTestReporter(capturingConsole, new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+            ShowTestResults = TestResultVisibility.None,
+        });
+
+        const string assembly = "/repo/bin/Debug/net9.0/Mixed.Tests.dll";
+        const string executionId = "exec-mixed";
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 1, isDiscovery: false, isHelp: false, isRetry: false);
+        reporter.AssemblyRunStarted(assembly, "net9.0", "x64", executionId, instanceId: "inst-1");
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-1", testUid: "passed", TestOutcome.Passed);
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-1", testUid: "skipped", TestOutcome.Skipped);
+        reporter.AssemblyRunCompleted(executionId, exitCode: 0, outputData: null, errorData: null);
+        reporter.TestExecutionCompleted(DateTimeOffset.UtcNow, exitCode: 0);
+
+        capturingConsole.GetOutput().Should().Contain($"{AnsiCodes.CSI}{(int)TerminalColor.DarkYellow}{AnsiCodes.SetColor}  skipped: 1");
+    }
+
+    [TestMethod]
+    public void TestCompleted_OnlyRendersSelectedOutcomes()
+    {
+        var capturingConsole = new CapturingConsole();
+        using var reporter = new TerminalTestReporter(capturingConsole, new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+            ShowTestResults = TestResultVisibility.Failed | TestResultVisibility.Skipped,
+        });
+
+        const string assembly = "/repo/bin/Debug/net9.0/Filtered.Tests.dll";
+        const string executionId = "exec-filtered";
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 1, isDiscovery: false, isHelp: false, isRetry: false);
+        reporter.AssemblyRunStarted(assembly, "net9.0", "x64", executionId, instanceId: "inst-1");
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-1", testUid: "passed-test", TestOutcome.Passed);
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-1", testUid: "failed-test", TestOutcome.Fail);
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-1", testUid: "skipped-test", TestOutcome.Skipped);
+
+        string output = StripAnsi(capturingConsole.GetOutput());
+        output.Should().NotContain("passed-test");
+        output.Should().Contain("failed-test");
+        output.Should().Contain("skipped-test");
+    }
+
+    [TestMethod]
+    public void TestCompleted_WithDifferentPerAssemblyVisibility_HonorsEachModule()
+    {
+        var capturingConsole = new CapturingConsole();
+        using var reporter = new TerminalTestReporter(capturingConsole, new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+            ShowTestResults = TestResultVisibility.None,
+        });
+
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 2, isDiscovery: false, isHelp: false, isRetry: false);
+        reporter.AssemblyRunStarted(
+            "/repo/PassedVisible.Tests.dll",
+            "net9.0",
+            "x64",
+            executionId: "exec-passed",
+            instanceId: "inst-passed",
+            attemptNumber: null,
+            settings: CreateSettings(TestResultVisibility.Passed));
+        reporter.AssemblyRunStarted(
+            "/repo/FailedVisible.Tests.dll",
+            "net9.0",
+            "x64",
+            executionId: "exec-failed",
+            instanceId: "inst-failed",
+            attemptNumber: null,
+            settings: CreateSettings(TestResultVisibility.Failed));
+
+        ReportTest(reporter, "/repo/PassedVisible.Tests.dll", "exec-passed", "inst-passed", "shown-pass", TestOutcome.Passed);
+        ReportTest(reporter, "/repo/PassedVisible.Tests.dll", "exec-passed", "inst-passed", "hidden-fail", TestOutcome.Fail);
+        ReportTest(reporter, "/repo/FailedVisible.Tests.dll", "exec-failed", "inst-failed", "hidden-pass", TestOutcome.Passed);
+        ReportTest(reporter, "/repo/FailedVisible.Tests.dll", "exec-failed", "inst-failed", "shown-fail", TestOutcome.Fail);
+
+        string output = StripAnsi(capturingConsole.GetOutput());
+        output.Should().Contain("shown-pass");
+        output.Should().Contain("shown-fail");
+        output.Should().NotContain("hidden-pass");
+        output.Should().NotContain("hidden-fail");
+    }
+
+    [TestMethod]
+    public void RetryRendering_IsScopedToTheConfiguredAssembly()
+    {
+        var capturingConsole = new CapturingConsole();
+        using var reporter = new TerminalTestReporter(capturingConsole, new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+            ShowAssembly = true,
+            ShowAssemblyStartAndComplete = true,
+            ShowTestResults = TestResultVisibility.Passed,
+        });
+
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 2, isDiscovery: false, isHelp: false, isRetry: false);
+        reporter.AssemblyRunStarted(
+            "/repo/Retry.Tests.dll",
+            "net9.0",
+            "x64",
+            executionId: "exec-retry",
+            instanceId: "inst-retry",
+            attemptNumber: 1,
+            settings: CreateSettings(TestResultVisibility.Passed, legacyRetryEnabled: true));
+        reporter.AssemblyRunStarted(
+            "/repo/Normal.Tests.dll",
+            "net9.0",
+            "x64",
+            executionId: "exec-normal",
+            instanceId: "inst-normal",
+            attemptNumber: 1,
+            settings: CreateSettings(TestResultVisibility.Passed));
+
+        ReportTest(reporter, "/repo/Retry.Tests.dll", "exec-retry", "inst-retry", "retry-test", TestOutcome.Passed);
+        ReportTest(reporter, "/repo/Normal.Tests.dll", "exec-normal", "inst-normal", "normal-test", TestOutcome.Passed);
+
+        string output = StripAnsi(capturingConsole.GetOutput());
+        output.Should().Contain("(try 1) Running tests from /repo/Retry.Tests.dll");
+        output.Should().NotContain("(try 1) Running tests from /repo/Normal.Tests.dll");
+        output.Should().Contain("passed (try 1) retry-test");
+        output.Should().Contain("passed normal-test");
+        output.Should().NotContain("passed (try 1) normal-test");
+    }
+
     /// <summary>
     /// When an assembly's tests were retried, the per-assembly summary should append a
     /// "/r{N}" segment to the compact counts block so users can tell the final counts came from retries.
@@ -220,6 +490,32 @@ public class TerminalTestReporterTests
 
         string assemblyLine = GetAssemblySummaryLine(capturingConsole.GetOutput(), assembly);
         assemblyLine.Should().Contain("[+1/x0/?0/r1]");
+    }
+
+    [TestMethod]
+    public void EnableRetry_BeforeFirstAssemblyRun_RendersTryOne()
+    {
+        var capturingConsole = new CapturingConsole();
+
+        using var reporter = new TerminalTestReporter(capturingConsole, new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+            ShowAssembly = true,
+            ShowAssemblyStartAndComplete = true,
+        });
+
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 1, isDiscovery: false, isHelp: false, isRetry: false);
+        reporter.EnableRetry();
+        reporter.AssemblyRunStarted(
+            "/repo/bin/Debug/net9.0/Retry.Tests.dll",
+            targetFramework: "net9.0",
+            architecture: "x64",
+            executionId: "exec-retry",
+            instanceId: "inst-1",
+            attemptNumber: 1);
+
+        StripAnsi(capturingConsole.GetOutput()).Should().Contain("(try 1) Running tests from");
     }
 
     /// <summary>
@@ -301,6 +597,47 @@ public class TerminalTestReporterTests
         output.Should().NotContain("help line 350");
     }
 
+    [TestMethod]
+    public void TestExecutionCompleted_WhenTextDiscoveryFindsTestsButFails_ColorizesSummaryAsFailure()
+    {
+        var capturingConsole = new CapturingConsole();
+
+        using var reporter = new TerminalTestReporter(capturingConsole, new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+            ListTestsFormat = TestListFormat.Text,
+        });
+
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 1, isDiscovery: true, isHelp: false, isRetry: false);
+        reporter.AssemblyRunStarted(
+            "/repo/bin/Debug/net9.0/MyTests.dll",
+            targetFramework: "net9.0",
+            architecture: "x64",
+            executionId: "exec-1",
+            instanceId: "inst-1");
+        reporter.TestDiscovered(
+            "exec-1",
+            new DiscoveredTestInfo(
+                DisplayName: "MyTest",
+                Uid: "test-1",
+                FilePath: null,
+                LineNumber: null,
+                Namespace: null,
+                TypeName: null,
+                MethodName: null,
+                ParameterTypeFullNames: [],
+                Traits: []));
+
+        reporter.TestExecutionCompleted(DateTimeOffset.UtcNow, exitCode: TestExitCode.InvalidCommandLine);
+
+        string summary = string.Format(CliCommandStrings.TestDiscoverySummarySingular, 1);
+        string output = capturingConsole.GetOutput();
+        output.Should().Contain($"{AnsiCodes.CSI}{(int)TerminalColor.DarkRed}{AnsiCodes.SetColor}{summary}");
+        output.Should().NotContain($"{AnsiCodes.CSI}{(int)TerminalColor.DarkGreen}{AnsiCodes.SetColor}{summary}");
+        output.Should().Contain("Test discovery completed with non-success exit code: 5.");
+    }
+
     /// <summary>
     /// '--list-tests json' renders a machine-readable JSON document from the discovered-test data the
     /// SDK already receives over the 'dotnet test' IPC protocol. The document is a versioned envelope
@@ -342,13 +679,10 @@ public class TerminalTestReporterTests
             ParameterTypeFullNames: ["System.Int32"],
             Traits: [("Category", "Fast")]));
 
-        reporter.TestExecutionCompleted(DateTimeOffset.UtcNow, exitCode: 0);
+        reporter.TestExecutionCompleted(DateTimeOffset.UtcNow, exitCode: TestExitCode.InvalidCommandLine);
 
         string output = capturingConsole.GetOutput();
-        int start = output.IndexOf('{');
-        start.Should().BeGreaterThanOrEqualTo(0, "the discovery output should contain a JSON document");
-
-        using var document = JsonDocument.Parse(output.Substring(start));
+        using var document = JsonDocument.Parse(output);
         JsonElement root = document.RootElement;
 
         root.GetProperty("version").GetString().Should().Be("1.0");
@@ -384,6 +718,21 @@ public class TerminalTestReporterTests
     }
 
     private static void ReportTest(TerminalTestReporter reporter, string assembly, string executionId, string instanceId, string testUid, TestOutcome outcome)
+        => ReportTest(reporter, assembly, executionId, instanceId, testUid, outcome, TimeSpan.FromMilliseconds(1));
+
+    private static TestApplicationSettings CreateSettings(
+        TestResultVisibility testResultVisibility,
+        int slowestTestsCount = 0,
+        bool showFlakyTests = true,
+        bool legacyRetryEnabled = false)
+        => new(
+            default,
+            testResultVisibility,
+            slowestTestsCount,
+            showFlakyTests,
+            LegacyRetryEnabled: legacyRetryEnabled);
+
+    private static void ReportTest(TerminalTestReporter reporter, string assembly, string executionId, string instanceId, string testUid, TestOutcome outcome, TimeSpan? duration)
     {
         reporter.TestCompleted(
             assembly: assembly,
@@ -395,13 +744,388 @@ public class TerminalTestReporterTests
             displayName: testUid,
             informativeMessage: null,
             outcome: outcome,
-            duration: TimeSpan.FromMilliseconds(1),
+            duration: duration,
             exceptions: null,
             expected: null,
             actual: null,
             standardOutput: null,
             errorOutput: null);
     }
+
+    /// <summary>
+    /// A test that failed on its first attempt and passed on a retry is "flaky": the run summary reports it in the
+    /// dedicated <c>flaky:</c> counter line, in the <c>retried:</c> accounting line, and by name in the
+    /// "Flaky tests:" section. See dotnet/sdk#55472 / dotnet/sdk#55473.
+    /// </summary>
+    [TestMethod]
+    public void TestExecutionCompleted_WhenRetriedTestRecovers_PrintsFlakyAccountingAndSection()
+    {
+        var capturingConsole = new CapturingConsole();
+
+        using var reporter = new TerminalTestReporter(capturingConsole, new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+            ShowAssembly = true,
+            ShowAssemblyStartAndComplete = false,
+        });
+
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 1, isDiscovery: false, isHelp: false, isRetry: true);
+
+        const string assembly = "/repo/bin/Debug/net9.0/Flaky.Tests.dll";
+        const string executionId = "exec-flaky";
+
+        reporter.AssemblyRunStarted(assembly, "net9.0", "x64", executionId, instanceId: "inst-1");
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-1", testUid: "flaky-1", TestOutcome.Fail);
+
+        reporter.AssemblyRunStarted(assembly, "net9.0", "x64", executionId, instanceId: "inst-2");
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-2", testUid: "flaky-1", TestOutcome.Passed);
+
+        reporter.AssemblyRunCompleted(executionId, exitCode: 0, outputData: null, errorData: null);
+        reporter.TestExecutionCompleted(DateTimeOffset.UtcNow, exitCode: 0);
+
+        string output = StripAnsi(capturingConsole.GetOutput());
+
+        output.Should().Contain("flaky: 1 (passed after retry)");
+        output.Should().Contain("retried: 1 test(s), 1 extra run(s)");
+        output.Should().Contain("Flaky tests:");
+        output.Should().Contain("flaky-1 failed -> passed (2 attempts)");
+
+        // The old '(+N retried)' suffix on the total line was replaced by the dedicated lines above.
+        output.Should().NotContain("(+1 retried)");
+    }
+
+    /// <summary>
+    /// A test that is retried but keeps failing is retried-but-not-flaky: it is accounted for by the
+    /// <c>retried:</c> line, but must not be counted as flaky nor listed in the "Flaky tests:" section, where it
+    /// would only duplicate the failure that is already reported with its full error output.
+    /// </summary>
+    [TestMethod]
+    public void TestExecutionCompleted_WhenRetriedTestNeverRecovers_ReportsRetriedButNotFlaky()
+    {
+        var capturingConsole = new CapturingConsole();
+
+        using var reporter = new TerminalTestReporter(capturingConsole, new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+            ShowAssembly = true,
+            ShowAssemblyStartAndComplete = false,
+        });
+
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 1, isDiscovery: false, isHelp: false, isRetry: true);
+
+        const string assembly = "/repo/bin/Debug/net9.0/Broken.Tests.dll";
+        const string executionId = "exec-broken";
+
+        reporter.AssemblyRunStarted(assembly, "net9.0", "x64", executionId, instanceId: "inst-1");
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-1", testUid: "broken-1", TestOutcome.Fail);
+
+        reporter.AssemblyRunStarted(assembly, "net9.0", "x64", executionId, instanceId: "inst-2");
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-2", testUid: "broken-1", TestOutcome.Fail);
+
+        reporter.AssemblyRunCompleted(executionId, exitCode: 1, outputData: null, errorData: null);
+        reporter.TestExecutionCompleted(DateTimeOffset.UtcNow, exitCode: 1);
+
+        string output = StripAnsi(capturingConsole.GetOutput());
+
+        output.Should().Contain("retried: 1 test(s), 1 extra run(s)");
+        output.Should().NotContain("flaky:");
+        output.Should().NotContain("Flaky tests:");
+    }
+
+    /// <summary>
+    /// '--show-flaky-tests off' suppresses both the <c>flaky:</c> counter line and the "Flaky tests:" section, while
+    /// the neutral <c>retried:</c> accounting stays.
+    /// </summary>
+    [TestMethod]
+    public void TestExecutionCompleted_WhenShowFlakyTestsIsOff_OmitsFlakyLineAndSection()
+    {
+        var capturingConsole = new CapturingConsole();
+
+        using var reporter = new TerminalTestReporter(capturingConsole, new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+            ShowAssembly = true,
+            ShowAssemblyStartAndComplete = false,
+            ShowFlakyTests = false,
+        });
+
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 1, isDiscovery: false, isHelp: false, isRetry: true);
+
+        const string assembly = "/repo/bin/Debug/net9.0/Flaky.Tests.dll";
+        const string executionId = "exec-flaky";
+
+        reporter.AssemblyRunStarted(assembly, "net9.0", "x64", executionId, instanceId: "inst-1");
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-1", testUid: "flaky-1", TestOutcome.Fail);
+
+        reporter.AssemblyRunStarted(assembly, "net9.0", "x64", executionId, instanceId: "inst-2");
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-2", testUid: "flaky-1", TestOutcome.Passed);
+
+        reporter.AssemblyRunCompleted(executionId, exitCode: 0, outputData: null, errorData: null);
+        reporter.TestExecutionCompleted(DateTimeOffset.UtcNow, exitCode: 0);
+
+        string output = StripAnsi(capturingConsole.GetOutput());
+
+        output.Should().Contain("retried: 1 test(s), 1 extra run(s)");
+        output.Should().NotContain("flaky:");
+        output.Should().NotContain("Flaky tests:");
+    }
+
+    /// <summary>
+    /// A run without retries keeps its historical summary: neither retry accounting line nor the flaky section is
+    /// rendered.
+    /// </summary>
+    [TestMethod]
+    public void TestExecutionCompleted_WithoutRetries_OmitsRetryAccountingLines()
+    {
+        var capturingConsole = new CapturingConsole();
+
+        using var reporter = new TerminalTestReporter(capturingConsole, new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+            ShowAssembly = true,
+            ShowAssemblyStartAndComplete = false,
+        });
+
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 1, isDiscovery: false, isHelp: false, isRetry: false);
+
+        const string assembly = "/repo/bin/Debug/net9.0/Stable.Tests.dll";
+        const string executionId = "exec-stable";
+
+        reporter.AssemblyRunStarted(assembly, "net9.0", "x64", executionId, instanceId: "inst-1");
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-1", testUid: "stable-1", TestOutcome.Passed);
+
+        reporter.AssemblyRunCompleted(executionId, exitCode: 0, outputData: null, errorData: null);
+        reporter.TestExecutionCompleted(DateTimeOffset.UtcNow, exitCode: 0);
+
+        string output = StripAnsi(capturingConsole.GetOutput());
+
+        output.Should().NotContain("retried:");
+        output.Should().NotContain("flaky:");
+        output.Should().NotContain("Flaky tests:");
+        output.Should().NotContain("Slowest tests:");
+    }
+
+    /// <summary>
+    /// '--show-slowest-tests N' appends a "Slowest tests:" section ranking the N longest-running tests by their
+    /// reported duration, slowest first.
+    /// </summary>
+    [TestMethod]
+    public void TestExecutionCompleted_WithSlowestTestsCount_PrintsSlowestSectionInDurationOrder()
+    {
+        var capturingConsole = new CapturingConsole();
+
+        using var reporter = new TerminalTestReporter(capturingConsole, new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+            ShowAssembly = true,
+            ShowAssemblyStartAndComplete = false,
+            SlowestTestsCount = 2,
+        });
+
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 1, isDiscovery: false, isHelp: false, isRetry: false);
+
+        const string assembly = "/repo/bin/Debug/net9.0/Slow.Tests.dll";
+        const string executionId = "exec-slow";
+
+        reporter.AssemblyRunStarted(assembly, "net9.0", "x64", executionId, instanceId: "inst-1");
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-1", testUid: "fast", TestOutcome.Passed, TimeSpan.FromSeconds(1));
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-1", testUid: "slowest", TestOutcome.Passed, TimeSpan.FromSeconds(9));
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-1", testUid: "middle", TestOutcome.Passed, TimeSpan.FromSeconds(5));
+
+        reporter.AssemblyRunCompleted(executionId, exitCode: 0, outputData: null, errorData: null);
+        reporter.TestExecutionCompleted(DateTimeOffset.UtcNow, exitCode: 0);
+
+        string output = StripAnsi(capturingConsole.GetOutput());
+        string section = output[output.IndexOf("Slowest tests:", StringComparison.Ordinal)..];
+
+        section.Should().Contain("slowest");
+        section.Should().Contain("middle");
+        // Only the two slowest are listed, in descending duration order.
+        section.Should().NotContain("fast");
+        section.IndexOf("slowest", StringComparison.Ordinal).Should().BeLessThan(section.IndexOf("middle", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    public void TestExecutionCompleted_WithDifferentPerAssemblySummarySettings_HonorsEachModule()
+    {
+        var capturingConsole = new CapturingConsole();
+        using var reporter = new TerminalTestReporter(capturingConsole, new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+            ShowAssembly = true,
+            ShowAssemblyStartAndComplete = false,
+            ShowTestResults = TestResultVisibility.None,
+        });
+
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 2, isDiscovery: false, isHelp: false, isRetry: true);
+
+        const string assemblyA = "/repo/A.Tests.dll";
+        const string assemblyB = "/repo/B.Tests.dll";
+
+        reporter.AssemblyRunStarted(
+            assemblyA,
+            "net9.0",
+            "x64",
+            executionId: "exec-A",
+            instanceId: "inst-A1",
+            attemptNumber: null,
+            settings: CreateSettings(TestResultVisibility.None, slowestTestsCount: 1, showFlakyTests: false));
+        ReportTest(reporter, assemblyA, "exec-A", "inst-A1", "a-slow", TestOutcome.Fail, TimeSpan.FromSeconds(9));
+        ReportTest(reporter, assemblyA, "exec-A", "inst-A1", "a-middle", TestOutcome.Passed, TimeSpan.FromSeconds(5));
+        ReportTest(reporter, assemblyA, "exec-A", "inst-A1", "a-fast", TestOutcome.Passed, TimeSpan.FromSeconds(1));
+        reporter.AssemblyRunStarted(
+            assemblyA,
+            "net9.0",
+            "x64",
+            executionId: "exec-A",
+            instanceId: "inst-A2",
+            attemptNumber: null,
+            settings: CreateSettings(TestResultVisibility.None, slowestTestsCount: 1, showFlakyTests: false));
+        ReportTest(reporter, assemblyA, "exec-A", "inst-A2", "a-slow", TestOutcome.Passed, TimeSpan.FromSeconds(7));
+
+        reporter.AssemblyRunStarted(
+            assemblyB,
+            "net9.0",
+            "x64",
+            executionId: "exec-B",
+            instanceId: "inst-B1",
+            attemptNumber: null,
+            settings: CreateSettings(TestResultVisibility.None, slowestTestsCount: 2, showFlakyTests: true));
+        ReportTest(reporter, assemblyB, "exec-B", "inst-B1", "b-slow", TestOutcome.Fail, TimeSpan.FromSeconds(8));
+        ReportTest(reporter, assemblyB, "exec-B", "inst-B1", "b-middle", TestOutcome.Passed, TimeSpan.FromSeconds(4));
+        ReportTest(reporter, assemblyB, "exec-B", "inst-B1", "b-fast", TestOutcome.Passed, TimeSpan.FromSeconds(1));
+        reporter.AssemblyRunStarted(
+            assemblyB,
+            "net9.0",
+            "x64",
+            executionId: "exec-B",
+            instanceId: "inst-B2",
+            attemptNumber: null,
+            settings: CreateSettings(TestResultVisibility.None, slowestTestsCount: 2, showFlakyTests: true));
+        ReportTest(reporter, assemblyB, "exec-B", "inst-B2", "b-slow", TestOutcome.Passed, TimeSpan.FromSeconds(6));
+
+        reporter.AssemblyRunCompleted("exec-A", exitCode: 0, outputData: null, errorData: null);
+        reporter.AssemblyRunCompleted("exec-B", exitCode: 0, outputData: null, errorData: null);
+        reporter.TestExecutionCompleted(DateTimeOffset.UtcNow, exitCode: 0);
+
+        string output = StripAnsi(capturingConsole.GetOutput());
+        output.Should().Contain("flaky: 1 (passed after retry)");
+
+        int flakyStart = output.IndexOf("Flaky tests:", StringComparison.Ordinal);
+        int slowestStart = output.IndexOf("Slowest tests:", StringComparison.Ordinal);
+        flakyStart.Should().BeGreaterThanOrEqualTo(0);
+        slowestStart.Should().BeGreaterThan(flakyStart);
+
+        string flakySection = output[flakyStart..slowestStart];
+        flakySection.Should().Contain("b-slow");
+        flakySection.Should().NotContain("a-slow");
+
+        string slowestSection = output[slowestStart..];
+        slowestSection.Should().Contain("a-slow");
+        slowestSection.Should().NotContain("a-middle");
+        slowestSection.Should().NotContain("a-fast");
+        slowestSection.Should().Contain("b-slow");
+        slowestSection.Should().Contain("b-middle");
+        slowestSection.Should().NotContain("b-fast");
+    }
+
+    /// <summary>
+    /// The slowest-tests ranking is keyed by test node uid, so a retried test replaces its earlier attempt's timing
+    /// instead of appearing twice.
+    /// </summary>
+    [TestMethod]
+    public void TestExecutionCompleted_WithSlowestTests_RetryReplacesEarlierAttemptDuration()
+    {
+        var capturingConsole = new CapturingConsole();
+
+        using var reporter = new TerminalTestReporter(capturingConsole, new TerminalTestReporterOptions
+        {
+            AnsiMode = AnsiMode.SimpleAnsi,
+            ShowProgress = false,
+            ShowAssembly = true,
+            ShowAssemblyStartAndComplete = false,
+            SlowestTestsCount = 5,
+        });
+
+        reporter.TestExecutionStarted(DateTimeOffset.UtcNow, workerCount: 1, isDiscovery: false, isHelp: false, isRetry: true);
+
+        const string assembly = "/repo/bin/Debug/net9.0/Flaky.Tests.dll";
+        const string executionId = "exec-flaky";
+
+        reporter.AssemblyRunStarted(assembly, "net9.0", "x64", executionId, instanceId: "inst-1");
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-1", testUid: "retried-1", TestOutcome.Fail, TimeSpan.FromSeconds(30));
+
+        reporter.AssemblyRunStarted(assembly, "net9.0", "x64", executionId, instanceId: "inst-2");
+        ReportTest(reporter, assembly, executionId, instanceId: "inst-2", testUid: "retried-1", TestOutcome.Passed, TimeSpan.FromSeconds(2));
+
+        reporter.AssemblyRunCompleted(executionId, exitCode: 0, outputData: null, errorData: null);
+        reporter.TestExecutionCompleted(DateTimeOffset.UtcNow, exitCode: 0);
+
+        string output = StripAnsi(capturingConsole.GetOutput());
+        string section = output[output.IndexOf("Slowest tests:", StringComparison.Ordinal)..];
+
+        // The final attempt's 2s timing wins; the superseded 30s entry is gone.
+        section.Should().Contain("2s 000ms retried-1");
+        section.Should().NotContain("30s");
+    }
+
+    [TestMethod]
+    [DataRow(new string[0], 0)]
+    [DataRow(new[] { "--show-slowest-tests" }, 0)]
+    [DataRow(new[] { "--show-slowest-tests", "0" }, 0)]
+    [DataRow(new[] { "--show-slowest-tests", "abc" }, 0)]
+    [DataRow(new[] { "--show-slowest-tests", "-1" }, 0)]
+    [DataRow(new[] { "--show-slowest-tests", "3" }, 3)]
+    [DataRow(new[] { "--show-slowest-tests=4" }, 4)]
+    [DataRow(new[] { "--show-slowest-tests:5" }, 5)]
+    [DataRow(new[] { "test", "--", "--show-slowest-tests", "7" }, 7)]
+    public void GetSlowestTestsCount_ParsesForwardedOption(string[] arguments, int expected)
+        => MicrosoftTestingPlatformTestCommand.GetSlowestTestsCount(arguments).Should().Be(expected);
+
+    [TestMethod]
+    [DataRow(new string[0], true)]
+    [DataRow(new[] { "--show-flaky-tests" }, true)]
+    [DataRow(new[] { "--show-flaky-tests", "on" }, true)]
+    [DataRow(new[] { "--show-flaky-tests", "off" }, false)]
+    [DataRow(new[] { "--show-flaky-tests", "Off" }, false)]
+    [DataRow(new[] { "--show-flaky-tests", "false" }, false)]
+    [DataRow(new[] { "--show-flaky-tests", "disable" }, false)]
+    [DataRow(new[] { "--show-flaky-tests", "0" }, false)]
+    [DataRow(new[] { "--show-flaky-tests=off" }, false)]
+    [DataRow(new[] { "--show-flaky-tests:on" }, true)]
+    public void GetShowFlakyTests_ParsesForwardedOption(string[] arguments, bool expected)
+        => MicrosoftTestingPlatformTestCommand.GetShowFlakyTests(arguments).Should().Be(expected);
+
+    [TestMethod]
+    [DataRow((int)OutputOptions.Minimal, (int)TestResultVisibility.Failed)]
+    [DataRow((int)OutputOptions.Normal, (int)(TestResultVisibility.Failed | TestResultVisibility.Skipped))]
+    [DataRow((int)OutputOptions.Detailed, (int)TestResultVisibility.All)]
+    public void GetTestResultVisibility_UsesOutputPreset(int output, int expected)
+        => MicrosoftTestingPlatformTestCommand.GetTestResultVisibility((OutputOptions)output, [])
+            .Should().Be((TestResultVisibility)expected);
+
+    [TestMethod]
+    [DataRow(new[] { "--show-test-results", "passed" }, (int)TestResultVisibility.Passed)]
+    [DataRow(new[] { "--show-test-results=failed,skipped" }, (int)(TestResultVisibility.Failed | TestResultVisibility.Skipped))]
+    [DataRow(new[] { "--show-test-results", "passed", "skipped" }, (int)(TestResultVisibility.Passed | TestResultVisibility.Skipped))]
+    [DataRow(new[] { "--show-test-results", "none" }, (int)TestResultVisibility.None)]
+    [DataRow(new[] { "--show-test-results", "all" }, (int)TestResultVisibility.All)]
+    public void GetTestResultVisibility_ExplicitSelectionOverridesOutput(string[] arguments, int expected)
+        => MicrosoftTestingPlatformTestCommand.GetTestResultVisibility(OutputOptions.Detailed, arguments)
+            .Should().Be((TestResultVisibility)expected);
+
+    [TestMethod]
+    [DataRow(new string[0], false)]
+    [DataRow(new[] { "--retry-failed-tests", "3" }, true)]
+    [DataRow(new[] { "test", "--", "--retry-failed-tests", "3" }, true)]
+    public void IsLegacyRetryOptionEnabled_ParsesForwardedOption(string[] arguments, bool expected)
+        => MicrosoftTestingPlatformTestCommand.IsLegacyRetryOptionEnabled(arguments).Should().Be(expected);
 
     /// <summary>
     /// Finds the per-assembly summary line for the given assembly. Multiple lines may mention the

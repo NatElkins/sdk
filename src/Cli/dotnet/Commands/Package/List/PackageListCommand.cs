@@ -11,7 +11,7 @@ using Microsoft.DotNet.Cli.Commands.MSBuild;
 using Microsoft.DotNet.Cli.Commands.NuGet;
 using Microsoft.DotNet.Cli.Commands.Run;
 using Microsoft.DotNet.Cli.Utils;
-using Microsoft.DotNet.ProjectTools;
+using Microsoft.DotNet.FileBasedPrograms;
 
 namespace Microsoft.DotNet.Cli.Commands.Package.List;
 
@@ -53,7 +53,8 @@ internal sealed class PackageListCommand(ParseResult parseResult) : CommandBase<
                 msbuildArgs: MSBuildArgs.FromProperties(new Dictionary<string, string>
                 {
                     ["NuGetInteractive"] = interactive.ToString(),
-                }.AsReadOnly()))
+                }.AsReadOnly()),
+                services: CommandServices.CreateDefault())
             {
                 NoCache = true,
                 NoBuild = true,
@@ -76,7 +77,10 @@ internal sealed class PackageListCommand(ParseResult parseResult) : CommandBase<
 
             args.Add($"-interactive:{interactive.ToString().ToLower()}");
 
-            command = new MSBuildForwardingApp(rawMSBuildArgs: args);
+            command = new MSBuildForwardingApp(
+                rawMSBuildArgs: args,
+                msbuildPath: null,
+                services: CommandServices.CreateDefault());
         }
 
         int exitCode = 0;

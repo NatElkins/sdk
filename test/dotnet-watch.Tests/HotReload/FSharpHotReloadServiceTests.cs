@@ -4,6 +4,7 @@
 using System.Collections.Immutable;
 using System.Reflection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.DotNet.HotReload;
 
 namespace Microsoft.DotNet.Watch.UnitTests;
 
@@ -246,6 +247,7 @@ public class FSharpHotReloadServiceTests
     }
 
     [TestMethod]
+    [ResourceLock(WellKnownResources.EnvironmentVariables)]
     [DataRow("0")]
     [DataRow("false")]
     public async Task KillSwitch_DisablesEntireBridge(string killSwitchValue)
