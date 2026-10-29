@@ -32,7 +32,7 @@ internal class FileWatcher(ILogger logger, EnvironmentOptions environmentOptions
 
         _disposed = true;
 
-        foreach (var (_, watcher) in _directoryTreeWatchers)
+        foreach (var (_, watcher) in _directoryTreeWatchers.Concat(_directoryWatchers))
         {
             watcher.OnFileChange -= WatcherChangedHandler;
             watcher.OnError -= WatcherErrorHandler;

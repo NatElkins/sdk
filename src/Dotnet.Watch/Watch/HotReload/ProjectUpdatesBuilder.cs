@@ -264,6 +264,14 @@ internal sealed partial class ProjectUpdatesBuilder
 
             if (updates.Status == HotReloadService.Status.Blocked || fsharpResult.Status == FSharpManagedUpdateStatus.Blocked)
             {
+                foreach (var issue in fsharpResult.Issues)
+                {
+                    if (!string.IsNullOrEmpty(issue.Message))
+                    {
+                        Logger.LogError("{Message}", issue.Message);
+                    }
+                }
+
                 // Neither compiler can retain a staged update when the other compiler blocks the batch.
                 return;
             }

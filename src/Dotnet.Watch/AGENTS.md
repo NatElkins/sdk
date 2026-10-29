@@ -172,6 +172,9 @@ Reload).
   `Microsoft.CodeAnalysis.ExternalAccess.HotReload`. F# uses `FSharpHotReloadService`.
   `ProjectUpdatesBuilder` combines updates and restart requests from both compilers.
   `RunningProjectsManager` delivers updates and retains them for new processes.
+- **The standalone watch host targets .NET 10.** Its compile references use
+  `FSharpWatchMicrosoftBuildVersion` from `eng/ManualVersions.props`.
+  Runtime MSBuild and the F# compiler come from the selected SDK.
 
 ## Tests
 

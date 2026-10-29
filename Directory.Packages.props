@@ -196,4 +196,8 @@
     <PackageVersion Include="PolySharp" Version="1.15.0" />
   </ItemGroup>
 
+  <!-- The standalone watch host targets .NET 10. Runtime MSBuild still comes from the selected SDK. -->
+  <ItemGroup Condition="'$(SdkTargetFramework)' == 'net10.0' and ('$(MSBuildProjectName)' == 'dotnet-watch' or '$(MSBuildProjectName)' == 'Microsoft.DotNet.HotReload.Watch' or '$(MSBuildProjectName)' == 'Microsoft.DotNet.ProjectTools')">
+    <PackageVersion Update="Microsoft.Build;Microsoft.Build.Framework;Microsoft.Build.Tasks.Core;Microsoft.Build.Utilities.Core;Microsoft.NET.StringTools" Version="$(FSharpWatchMicrosoftBuildVersion)" />
+  </ItemGroup>
 </Project>

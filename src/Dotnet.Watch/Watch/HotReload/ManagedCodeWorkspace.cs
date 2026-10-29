@@ -40,7 +40,7 @@ internal sealed class ManagedCodeWorkspace : IDisposable
 
     public void Dispose()
     {
-        FSharpHotReloadService.EndSession();
+        FSharpHotReloadService.Dispose();
         _workspace.Dispose();
     }
 
