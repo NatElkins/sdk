@@ -51,9 +51,12 @@ internal sealed class FSharpSdkPreparation : IDisposable
     {
         // Task isolation allows SDK NuGet versions to differ from the tool. A replacement requires a fresh task context.
         var dependencies = Directory.EnumerateFiles(sdkDirectory).Where(path =>
-            Path.GetFileName(path).StartsWith("NuGet.", StringComparison.OrdinalIgnoreCase) ||
-            Path.GetFileName(path).StartsWith("Microsoft.Build.", StringComparison.OrdinalIgnoreCase) ||
-            Path.GetFileName(path).StartsWith("MSBuild.", StringComparison.OrdinalIgnoreCase));
+        {
+            var fileName = Path.GetFileName(path.AsSpan());
+            return fileName.StartsWith("NuGet.", StringComparison.OrdinalIgnoreCase) ||
+                fileName.StartsWith("Microsoft.Build.", StringComparison.OrdinalIgnoreCase) ||
+                fileName.StartsWith("MSBuild.", StringComparison.OrdinalIgnoreCase);
+        });
         return FSharpCompilerIdentity.HashFiles(dependencies);
     }
 
